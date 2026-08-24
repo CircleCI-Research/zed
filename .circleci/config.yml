@@ -131,6 +131,11 @@ jobs:
 
   test_linux:
     executor: linux
+    # The workspace suite is ~8500 tests and takes about half an hour on top of
+    # the workspace build, which overran the one hour job limit as a single
+    # container. Shard the test run; every container still builds the whole
+    # workspace, so more shards past this buy little.
+    parallelism: 4
     steps:
       - checkout
       - restore_rust_cache
@@ -153,7 +158,9 @@ jobs:
             until docker exec zed-postgres pg_isready; do sleep 1; done
       - run:
           name: Run workspace tests
-          command: cargo nextest run --workspace --no-fail-fast --no-tests=warn
+          command: |
+            cargo nextest run --workspace --no-fail-fast --no-tests=warn \
+              --partition "count:$((CIRCLE_NODE_INDEX + 1))/$CIRCLE_NODE_TOTAL"
           no_output_timeout: 30m
       - save_rust_cache
 

@@ -949,7 +949,9 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
     await_or_timeout(
         &executor,
         "awaiting install_dev_extension",
-        60,
+        // This compiles the test extension's Rust crate to wasm32-wasip1 from a
+        // cold target dir, which takes well over a minute on a CI executor.
+        240,
         extension_store.update(cx, |store, cx| {
             store.install_dev_extension(test_extension_dir.clone(), cx)
         }),
