@@ -9,7 +9,7 @@ executors:
   linux:
     machine:
       image: ubuntu-2204:current
-    resource_class: xlarge
+    resource_class: medium
     environment:
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
