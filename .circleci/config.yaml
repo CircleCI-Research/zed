@@ -1,0 +1,218 @@
+version: 2.1
+
+parameters:
+  run_nix_build:
+    type: boolean
+    default: false
+
+executors:
+  linux:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: xlarge
+    environment:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CC: clang
+      CXX: clang++
+
+commands:
+  install_linux_dependencies:
+    steps:
+      - run:
+          name: Install Linux dependencies
+          command: ./script/linux
+      - run:
+          name: Configure Rust environment
+          command: |
+            echo 'source "$HOME/.cargo/env"' >> "$BASH_ENV"
+            source "$HOME/.cargo/env"
+            rustup show
+  restore_rust_cache:
+    steps:
+      - restore_cache:
+          keys:
+            - rust-v2-{{ checksum "Cargo.lock" }}-{{ checksum "rust-toolchain.toml" }}
+            - rust-v2-
+  save_rust_cache:
+    steps:
+      - save_cache:
+          key: rust-v2-{{ checksum "Cargo.lock" }}-{{ checksum "rust-toolchain.toml" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+            - target
+  configure_cargo:
+    steps:
+      - run:
+          name: Configure Cargo
+          command: |
+            mkdir -p ../.cargo
+            cp .cargo/ci-config.toml ../.cargo/config.toml
+  install_nextest:
+    steps:
+      - run:
+          name: Install nextest
+          command: cargo install cargo-nextest --locked
+
+jobs:
+  check_style:
+    executor: linux
+    steps:
+      - checkout
+      - restore_rust_cache
+      - install_linux_dependencies
+      - run:
+          name: Install Node and pnpm
+          command: |
+            export NVM_DIR="$HOME/.nvm"
+            if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+            fi
+            . "$NVM_DIR/nvm.sh"
+            nvm install 24
+            nvm use 24
+            npm install --global pnpm@9
+            {
+              echo 'export NVM_DIR="$HOME/.nvm"'
+              echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+              echo 'nvm use 24 >/dev/null'
+            } >> "$BASH_ENV"
+      - run:
+          name: Check Prettier formatting
+          command: ./script/prettier
+      - run:
+          name: Check Rust formatting
+          command: cargo fmt --all -- --check
+      - run:
+          name: Check TODOs
+          command: ./script/check-todos
+      - run:
+          name: Check keymaps
+          command: ./script/check-keymaps
+      - run:
+          name: Check spelling
+          command: |
+            cargo install typos-cli --locked
+            typos --config ./typos.toml
+      - save_rust_cache
+
+  clippy_linux:
+    executor: linux
+    steps:
+      - checkout
+      - restore_rust_cache
+      - install_linux_dependencies
+      - configure_cargo
+      - run:
+          name: Download WASI SDK
+          command: ./script/download-wasi-sdk
+      - run:
+          name: Run Clippy
+          command: ./script/clippy
+      - save_rust_cache
+
+  test_linux:
+    executor: linux
+    steps:
+      - checkout
+      - restore_rust_cache
+      - install_linux_dependencies
+      - configure_cargo
+      - run:
+          name: Download WASI SDK
+          command: ./script/download-wasi-sdk
+      - install_nextest
+      - run:
+          name: Limit target directory size
+          command: ./script/clear-target-dir-if-larger-than 350 200
+      - run:
+          name: Start PostgreSQL
+          command: |
+            docker run --detach --name zed-postgres \
+              --env POSTGRES_HOST_AUTH_METHOD=trust \
+              --publish 5432:5432 \
+              postgres:15
+            until docker exec zed-postgres pg_isready; do sleep 1; done
+      - run:
+          name: Run workspace tests
+          command: cargo nextest run --workspace --no-fail-fast --no-tests=warn
+      - save_rust_cache
+
+  doctests:
+    executor: linux
+    steps:
+      - checkout
+      - restore_rust_cache
+      - install_linux_dependencies
+      - configure_cargo
+      - run:
+          name: Download WASI SDK
+          command: ./script/download-wasi-sdk
+      - run:
+          name: Run doctests
+          command: cargo test --workspace --doc --no-fail-fast
+      - save_rust_cache
+
+  check_workspace_binaries:
+    executor: linux
+    steps:
+      - checkout
+      - restore_rust_cache
+      - install_linux_dependencies
+      - configure_cargo
+      - run:
+          name: Download WASI SDK
+          command: ./script/download-wasi-sdk
+      - run:
+          name: Build workspace binaries and examples
+          command: |
+            cargo build -p collab
+            cargo build --workspace --bins --examples
+      - save_rust_cache
+
+  check_wasm:
+    executor: linux
+    steps:
+      - checkout
+      - restore_rust_cache
+      - install_linux_dependencies
+      - configure_cargo
+      - run:
+          name: Install nightly WASM toolchain
+          command: rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
+      - run:
+          name: Check WASM packages
+          command: cargo -Zbuild-std=std,panic_abort check --target wasm32-unknown-unknown -p gpui_platform -p cloud_api_client
+          environment:
+            CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: -C target-feature=+atomics,+bulk-memory,+mutable-globals
+            RUSTC_BOOTSTRAP: "1"
+      - save_rust_cache
+
+  nix_build:
+    executor: linux
+    steps:
+      - checkout
+      - run:
+          name: Install Nix
+          command: curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install | sh -s -- --daemon --yes
+      - run:
+          name: Build Nix package
+          command: |
+            . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+            nix build .#default -L --accept-flake-config
+
+workflows:
+  verify:
+    jobs:
+      - check_style
+      - clippy_linux
+      - test_linux
+      - doctests
+      - check_workspace_binaries
+      - check_wasm
+  nix:
+    when: << pipeline.parameters.run_nix_build >>
+    jobs:
+      - nix_build
