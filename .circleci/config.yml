@@ -9,17 +9,30 @@ executors:
   linux:
     machine:
       image: ubuntu-2204:current
-    resource_class: medium
+    resource_class: large
     environment:
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
       CC: clang
       CXX: clang++
+      DEBIAN_FRONTEND: noninteractive
 
 commands:
   install_linux_dependencies:
     steps:
+      - run:
+          name: Make apt non-interactive
+          # The ubuntu-2204 image ships needrestart, which raises a debconf
+          # dialog ("Daemons using outdated libraries") mid-install. With no TTY
+          # to answer it, apt blocks until the step's no-output timeout kills the
+          # job. DEBIAN_FRONTEND alone is not enough: script/linux runs apt via
+          # sudo, which strips it from the environment.
+          command: |
+            echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
+            sudo mkdir -p /etc/needrestart/conf.d
+            printf '$nrconf{restart} = "a";\n$nrconf{kernelhints} = 0;\n' \
+              | sudo tee /etc/needrestart/conf.d/99-circleci.conf > /dev/null
       - run:
           name: Install Linux dependencies
           command: ./script/linux
@@ -55,6 +68,7 @@ commands:
       - run:
           name: Install nextest
           command: cargo install cargo-nextest --locked
+          no_output_timeout: 30m
 
 jobs:
   check_style:
@@ -96,6 +110,7 @@ jobs:
           command: |
             cargo install typos-cli --locked
             typos --config ./typos.toml
+          no_output_timeout: 30m
       - save_rust_cache
 
   clippy_linux:
@@ -111,6 +126,7 @@ jobs:
       - run:
           name: Run Clippy
           command: ./script/clippy
+          no_output_timeout: 30m
       - save_rust_cache
 
   test_linux:
@@ -138,6 +154,7 @@ jobs:
       - run:
           name: Run workspace tests
           command: cargo nextest run --workspace --no-fail-fast --no-tests=warn
+          no_output_timeout: 30m
       - save_rust_cache
 
   doctests:
@@ -153,6 +170,7 @@ jobs:
       - run:
           name: Run doctests
           command: cargo test --workspace --doc --no-fail-fast
+          no_output_timeout: 30m
       - save_rust_cache
 
   check_workspace_binaries:
@@ -170,6 +188,7 @@ jobs:
           command: |
             cargo build -p collab
             cargo build --workspace --bins --examples
+          no_output_timeout: 30m
       - save_rust_cache
 
   check_wasm:
@@ -182,9 +201,11 @@ jobs:
       - run:
           name: Install nightly WASM toolchain
           command: rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
+          no_output_timeout: 30m
       - run:
           name: Check WASM packages
           command: cargo -Zbuild-std=std,panic_abort check --target wasm32-unknown-unknown -p gpui_platform -p cloud_api_client
+          no_output_timeout: 30m
           environment:
             CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: -C target-feature=+atomics,+bulk-memory,+mutable-globals
             RUSTC_BOOTSTRAP: "1"
