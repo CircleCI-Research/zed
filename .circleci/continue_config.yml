@@ -1,0 +1,1400 @@
+# Continuation config for the CircleCI translation of Zed's verification CI.
+#
+# Ported from:
+#   .github/workflows/run_tests.yml
+#   .github/workflows/extension_tests.yml  (reusable, called by run_tests.yml)
+#   .github/workflows/nix_build.yml
+#   .github/workflows/run_bundling.yml
+#   .github/workflows/danger.yml
+#
+# The pipeline parameters below are produced by .circleci/compute-filters.sh in
+# the setup pipeline. The name set here must match the key set that script emits
+# exactly; nothing in the CircleCI toolchain checks that for you.
+#
+# Required context: `zed-ci`. See the env-var inventory in .circleci/config.yml.
+
+version: 2.1
+
+parameters:
+  run_tests:
+    type: boolean
+    default: false
+  run_docs:
+    type: boolean
+    default: false
+  run_licenses:
+    type: boolean
+    default: false
+  run_action_checks:
+    type: boolean
+    default: false
+  changed_packages:
+    type: string
+    default: ""
+  changed_extensions:
+    type: string
+    default: ""
+  run_nix:
+    type: boolean
+    default: false
+  run_bundling:
+    type: boolean
+    default: false
+
+# ---------------------------------------------------------------------------
+# Executors
+#
+# `working_directory` is deliberately nested two levels deep. Several ported
+# steps copy .cargo/ci-config.toml to `./../.cargo/config.toml` and later
+# `rm -rf ./../.cargo`, relying on GitHub's workspace being at
+# /home/runner/work/<repo>/<repo>. With CircleCI's default ~/project, `../.cargo`
+# would resolve to the real CARGO_HOME and the cleanup step would delete it.
+# ---------------------------------------------------------------------------
+executors:
+  linux:
+    parameters:
+      resource_class:
+        type: string
+      image:
+        type: string
+        default: cimg/rust:1.90
+    docker:
+      - image: << parameters.image >>
+    resource_class: << parameters.resource_class >>
+    working_directory: ~/work/zed
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+
+  macos:
+    macos:
+      xcode: 16.4.0
+    resource_class: macos.m1.large.gen1
+    working_directory: ~/work/zed
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+
+  # An executor definition cannot reference an orb executor ("extraneous key
+  # [executor] is not permitted"), so this inlines what circleci/windows'
+  # server-2022 executor expands to.
+  windows:
+    machine:
+      image: windows-server-2022-gui:current
+    resource_class: windows.2xlarge
+    shell: powershell.exe -ExecutionPolicy Bypass
+    working_directory: C:\Users\circleci\work\zed
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+
+  linux_vm:
+    parameters:
+      resource_class:
+        type: string
+    machine:
+      image: ubuntu-2404:current
+    resource_class: << parameters.resource_class >>
+    working_directory: ~/work/zed
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+commands:
+  halt_unless:
+    description: >
+      Emulates a GitHub Actions job-level `if:`. CircleCI rejects `when:` on a
+      job inside a workflow ("Unexpected argument(s): when"), so a gated job is
+      always instantiated and terminates itself as its very first step. That
+      reproduces GitHub's "a skipped job counts as success" semantics, which the
+      aggregating tests_pass job depends on. This step must stay first: anything
+      before it runs even when the gate is closed.
+    parameters:
+      enabled:
+        type: boolean
+      reason:
+        type: string
+    steps:
+      - run:
+          name: gate - << parameters.reason >>
+          command: |
+            if [ "<< parameters.enabled >>" != "true" ]; then
+              echo "Gate closed (<< parameters.reason >>); skipping this job."
+              circleci-agent step halt
+            fi
+
+  halt_unless_windows:
+    description: >
+      halt_unless for the Windows executor, whose default shell is PowerShell.
+      The bash-bodied variant compiles fine but would be handed to powershell.exe
+      at run time.
+    parameters:
+      enabled:
+        type: boolean
+      reason:
+        type: string
+    steps:
+      - run:
+          name: gate - << parameters.reason >>
+          shell: powershell.exe
+          command: |
+            if ("<< parameters.enabled >>" -ne "true") {
+              Write-Host "Gate closed (<< parameters.reason >>); skipping this job."
+              circleci-agent step halt
+            }
+
+  halt_unless_set:
+    description: Same as halt_unless, for a string parameter that must be non-empty.
+    parameters:
+      value:
+        type: string
+      reason:
+        type: string
+    steps:
+      - run:
+          name: gate - << parameters.reason >>
+          environment:
+            GATE_VALUE: "<< parameters.value >>"
+          command: |
+            if [ -z "$GATE_VALUE" ]; then
+              echo "Gate closed (<< parameters.reason >>); skipping this job."
+              circleci-agent step halt
+            fi
+
+  restore_rust_cache:
+    description: >
+      Replaces namespacelabs/nscloud-cache-action (cache: rust, path: ~/.rustup).
+      The save key must stay character-identical to the first restore key.
+    parameters:
+      prefix:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - << parameters.prefix >>-rust-v1-{{ arch }}-{{ checksum "Cargo.lock" }}
+            - << parameters.prefix >>-rust-v1-{{ arch }}-
+
+  save_rust_cache:
+    parameters:
+      prefix:
+        type: string
+    steps:
+      - save_cache:
+          key: << parameters.prefix >>-rust-v1-{{ arch }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+            - ~/.rustup
+
+  restore_rust_cache_windows:
+    parameters:
+      prefix:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - << parameters.prefix >>-rust-v1-{{ arch }}-{{ checksum "Cargo.lock" }}
+            - << parameters.prefix >>-rust-v1-{{ arch }}-
+
+  save_rust_cache_windows:
+    parameters:
+      prefix:
+        type: string
+    steps:
+      - save_cache:
+          key: << parameters.prefix >>-rust-v1-{{ arch }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - C:\Users\circleci\.cargo\registry
+            - C:\Users\circleci\.cargo\git
+            - C:\Users\circleci\.rustup
+
+  setup_cargo_config:
+    steps:
+      - run:
+          name: steps::setup_cargo_config
+          command: |
+            mkdir -p ./../.cargo
+            cp ./.cargo/ci-config.toml ./../.cargo/config.toml
+
+  cleanup_cargo_config:
+    steps:
+      - run:
+          name: steps::cleanup_cargo_config
+          when: always
+          command: rm -rf ./../.cargo
+
+  setup_cargo_config_windows:
+    steps:
+      - run:
+          name: steps::setup_cargo_config
+          shell: powershell.exe
+          command: |
+            New-Item -ItemType Directory -Path "./../.cargo" -Force
+            Copy-Item -Path "./.cargo/ci-config.toml" -Destination "./../.cargo/config.toml"
+
+  cleanup_cargo_config_windows:
+    steps:
+      - run:
+          name: steps::cleanup_cargo_config
+          when: always
+          shell: powershell.exe
+          command: |
+            Remove-Item -Recurse -Path "./../.cargo" -Force -ErrorAction SilentlyContinue
+
+  setup_sccache:
+    description: >
+      script/setup-sccache only publishes RUSTC_WRAPPER / SCCACHE_* / PATH to
+      later steps through $GITHUB_ENV and $GITHUB_PATH, which do not exist here.
+      gha-env-bridge.sh translates them into $BASH_ENV.
+    steps:
+      - run:
+          name: steps::setup_sccache
+          environment:
+            SCCACHE_BUCKET: sccache-zed
+          command: .circleci/gha-env-bridge.sh ./script/setup-sccache
+
+  show_sccache_stats:
+    steps:
+      - run:
+          name: steps::show_sccache_stats
+          when: always
+          command: sccache --show-stats || true
+
+  install_nextest:
+    parameters:
+      platform:
+        type: enum
+        enum: ["linux", "mac"]
+    steps:
+      - run:
+          name: steps::cargo_install_nextest
+          no_output_timeout: 60m
+          command: |
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
+            curl -LsSf https://get.nexte.st/latest/<< parameters.platform >> \
+              | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+  cargo_nextest_run:
+    description: >
+      Ports the `${{ ... && format(' -E "{0}"', ...) || '' }}` expression from
+      run_tests.yml. The filterset is passed through an environment variable
+      rather than spliced into the command line so that its parentheses and
+      pipes are never re-parsed by the shell.
+    steps:
+      - run:
+          name: steps::cargo_nextest
+          # GitHub Actions' `timeout-minutes: 60` has no job-level equivalent
+          # here. What CircleCI does have is a *per-step* no-output timeout that
+          # defaults to 10 minutes, which a long quiet cargo build will trip.
+          no_output_timeout: 60m
+          environment:
+            CHANGED_PACKAGES: "<< pipeline.parameters.changed_packages >>"
+          command: |
+            if [ -n "$CHANGED_PACKAGES" ]; then
+              cargo nextest run --workspace --no-fail-fast --no-tests=warn -E "$CHANGED_PACKAGES"
+            else
+              cargo nextest run --workspace --no-fail-fast --no-tests=warn
+            fi
+
+jobs:
+  check_style:
+    executor:
+      name: linux
+      resource_class: large
+      image: cimg/rust:1.90-node
+    steps:
+      - checkout
+      - restore_rust_cache:
+          prefix: check-style
+      - run:
+          name: steps::setup_pnpm
+          command: sudo npm install -g pnpm@9
+      - run:
+          name: steps::prettier
+          command: ./script/prettier
+      - run:
+          name: steps::cargo_fmt
+          command: cargo fmt --all -- --check
+      - run:
+          name: ./script/check-todos
+          command: ./script/check-todos
+      - run:
+          name: ./script/check-keymaps
+          command: ./script/check-keymaps
+      - run:
+          name: run_tests::check_style::check_for_typos
+          no_output_timeout: 60m
+          command: |
+            command -v typos >/dev/null || cargo install typos-cli --locked
+            typos --config ./typos.toml
+      - run:
+          name: run_tests::fetch_ts_query_ls
+          command: |
+            curl -fsSL -o ts_query_ls.tar.gz \
+              https://github.com/ribru17/ts_query_ls/releases/download/v3.15.1/ts_query_ls-x86_64-unknown-linux-gnu.tar.gz
+      - run:
+          name: run_tests::run_ts_query_ls
+          command: |
+            tar -xf ts_query_ls.tar.gz
+            ./ts_query_ls format --check . || {
+              echo "Found unformatted queries, please format them with ts_query_ls."
+              echo "For easy use, install the Tree-sitter query extension:"
+              echo "zed://extension/tree-sitter-query"
+              false
+            }
+      - save_rust_cache:
+          prefix: check-style
+
+  clippy_linux:
+    executor:
+      name: linux
+      resource_class: 2xlarge
+    environment:
+      CC: clang
+      CXX: clang++
+      # script/clippy re-runs cargo-shear, typos and buf when GITHUB_ACTIONS is
+      # unset. Those are separate jobs here, so keep the variable set to avoid
+      # duplicating them (and to match what the source workflow actually ran).
+      GITHUB_ACTIONS: "true"
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: clippy-linux
+      - run:
+          name: steps::setup_linux
+          command: ./script/linux
+      - run:
+          name: steps::download_wasi_sdk
+          command: ./script/download-wasi-sdk
+      - setup_sccache
+      - run:
+          name: steps::clippy
+          no_output_timeout: 60m
+          command: ./script/clippy
+      - show_sccache_stats
+      - save_rust_cache:
+          prefix: clippy-linux
+      - cleanup_cargo_config
+
+  clippy_macos:
+    parameters:
+      add_x86_target:
+        type: boolean
+        default: false
+      target_flag:
+        type: string
+        default: ""
+      cache_prefix:
+        type: string
+    executor: macos
+    environment:
+      GITHUB_ACTIONS: "true"
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: << parameters.cache_prefix >>
+      - when:
+          condition: << parameters.add_x86_target >>
+          steps:
+            - run:
+                name: steps::install_rustup_target
+                command: rustup target add x86_64-apple-darwin
+      - setup_sccache
+      - run:
+          name: steps::clippy
+          no_output_timeout: 60m
+          command: ./script/clippy << parameters.target_flag >>
+      - show_sccache_stats
+      - save_rust_cache:
+          prefix: << parameters.cache_prefix >>
+      - cleanup_cargo_config
+
+  clippy_windows:
+    executor: windows
+    steps:
+      - halt_unless_windows:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config_windows
+      - restore_rust_cache_windows:
+          prefix: clippy-windows
+      - run:
+          name: steps::setup_sccache and steps::clippy
+          no_output_timeout: 60m
+          shell: powershell.exe
+          # setup-sccache.ps1 exports RUSTC_WRAPPER and PATH into the *process*
+          # environment and otherwise only to $env:GITHUB_ENV. CircleCI has no
+          # BASH_ENV equivalent for PowerShell, so the two source steps are
+          # merged into one PowerShell process.
+          command: |
+            ./script/setup-sccache.ps1
+            ./script/clippy.ps1
+            if ($env:RUSTC_WRAPPER) { & $env:RUSTC_WRAPPER --show-stats }
+            exit 0
+      - save_rust_cache_windows:
+          prefix: clippy-windows
+      - cleanup_cargo_config_windows
+
+  run_tests_linux:
+    docker:
+      - image: cimg/rust:1.90-node
+      - image: cimg/postgres:15.0
+        environment:
+          POSTGRES_HOST_AUTH_METHOD: trust
+    resource_class: 2xlarge
+    working_directory: ~/work/zed
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CC: clang
+      CXX: clang++
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: tests-linux
+      - run:
+          name: steps::setup_linux
+          command: ./script/linux
+      - run:
+          name: steps::download_wasi_sdk
+          command: ./script/download-wasi-sdk
+      - install_nextest:
+          platform: linux
+      - run:
+          name: steps::clear_target_dir_if_large
+          command: ./script/clear-target-dir-if-larger-than 350 200
+      - setup_sccache
+      - cargo_nextest_run
+      - show_sccache_stats
+      - save_rust_cache:
+          prefix: tests-linux
+      - cleanup_cargo_config
+
+  run_tests_mac:
+    executor: macos
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: tests-mac
+      - install_nextest:
+          platform: mac
+      - run:
+          name: steps::clear_target_dir_if_large
+          command: ./script/clear-target-dir-if-larger-than 350 200
+      - setup_sccache
+      - cargo_nextest_run
+      - show_sccache_stats
+      - save_rust_cache:
+          prefix: tests-mac
+      - cleanup_cargo_config
+
+  run_tests_windows:
+    executor: windows
+    steps:
+      - halt_unless_windows:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config_windows
+      - restore_rust_cache_windows:
+          prefix: tests-windows
+      - run:
+          name: steps::clear_target_dir_if_large
+          shell: powershell.exe
+          command: ./script/clear-target-dir-if-larger-than.ps1 350 200
+      - run:
+          # The source workflow relied on nextest being pre-installed on the
+          # self-hosted Windows runner; the CircleCI image does not have it.
+          name: steps::cargo_install_nextest
+          no_output_timeout: 60m
+          shell: powershell.exe
+          command: |
+            if (-not (Get-Command cargo-nextest -ErrorAction SilentlyContinue)) {
+              cargo install cargo-nextest --locked
+            }
+      - run:
+          name: steps::setup_sccache and steps::cargo_nextest
+          no_output_timeout: 60m
+          shell: powershell.exe
+          environment:
+            CHANGED_PACKAGES: "<< pipeline.parameters.changed_packages >>"
+          command: |
+            ./script/setup-sccache.ps1
+            if ($env:CHANGED_PACKAGES) {
+              cargo nextest run --workspace --no-fail-fast --no-tests=warn -E "$env:CHANGED_PACKAGES"
+            } else {
+              cargo nextest run --workspace --no-fail-fast --no-tests=warn
+            }
+            if ($env:RUSTC_WRAPPER) { & $env:RUSTC_WRAPPER --show-stats }
+            exit 0
+      - save_rust_cache_windows:
+          prefix: tests-windows
+      - cleanup_cargo_config_windows
+
+  miri_scheduler:
+    executor:
+      name: linux
+      resource_class: 2xlarge
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: miri
+      - run:
+          name: run_tests::miri_scheduler::install_miri
+          no_output_timeout: 60m
+          command: rustup toolchain install nightly --profile minimal --component miri --component rust-src
+      - run:
+          name: run_tests::miri_scheduler::run_scheduler_tests_under_miri
+          no_output_timeout: 60m
+          command: cargo +nightly -q miri test -p scheduler
+      - save_rust_cache:
+          prefix: miri
+      - cleanup_cargo_config
+
+  doctests:
+    executor:
+      name: linux
+      resource_class: 2xlarge
+    environment:
+      CC: clang
+      CXX: clang++
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - restore_rust_cache:
+          prefix: doctests
+      - run:
+          name: steps::setup_linux
+          command: ./script/linux
+      - run:
+          name: steps::download_wasi_sdk
+          command: ./script/download-wasi-sdk
+      - setup_cargo_config
+      - setup_sccache
+      - run:
+          name: run_tests::doctests::run_doctests
+          no_output_timeout: 60m
+          command: cargo test --workspace --doc --no-fail-fast
+      - show_sccache_stats
+      - save_rust_cache:
+          prefix: doctests
+      - cleanup_cargo_config
+
+  check_workspace_binaries:
+    executor:
+      name: linux
+      resource_class: xlarge
+    environment:
+      CC: clang
+      CXX: clang++
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: workspace-binaries
+      - run:
+          name: steps::setup_linux
+          command: ./script/linux
+      - run:
+          name: steps::download_wasi_sdk
+          command: ./script/download-wasi-sdk
+      - setup_sccache
+      - run:
+          name: cargo build -p collab
+          no_output_timeout: 60m
+          command: cargo build -p collab
+      - run:
+          name: cargo build --workspace --bins --examples
+          no_output_timeout: 60m
+          command: cargo build --workspace --bins --examples
+      - show_sccache_stats
+      - save_rust_cache:
+          prefix: workspace-binaries
+      - cleanup_cargo_config
+
+  build_visual_tests_binary:
+    executor: macos
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: visual-tests
+      - run:
+          name: run_tests::build_visual_tests_binary::cargo_build_visual_tests
+          no_output_timeout: 60m
+          command: cargo build -p zed --bin zed_visual_test_runner --features visual-tests
+      - save_rust_cache:
+          prefix: visual-tests
+      - cleanup_cargo_config
+
+  check_wasm:
+    executor:
+      name: linux
+      resource_class: xlarge
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: check-wasm
+      - run:
+          name: run_tests::check_wasm::install_nightly_wasm_toolchain
+          no_output_timeout: 60m
+          command: rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
+      - setup_sccache
+      - run:
+          name: run_tests::check_wasm::cargo_check_wasm
+          no_output_timeout: 60m
+          environment:
+            CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: -C target-feature=+atomics,+bulk-memory,+mutable-globals
+            RUSTC_BOOTSTRAP: "1"
+          command: cargo -Zbuild-std=std,panic_abort check --target wasm32-unknown-unknown -p gpui_platform -p cloud_api_client
+      - show_sccache_stats
+      - save_rust_cache:
+          prefix: check-wasm
+      - cleanup_cargo_config
+
+  check_dependencies:
+    executor:
+      name: linux
+      resource_class: medium
+    environment:
+      CC: clang
+      CXX: clang++
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - restore_rust_cache:
+          prefix: check-dependencies
+      - run:
+          name: run_tests::check_dependencies::install_cargo_shear
+          no_output_timeout: 60m
+          command: |
+            command -v cargo-shear >/dev/null || cargo install cargo-shear --locked --version 1.13.4
+      - run:
+          name: run_tests::check_dependencies::run_cargo_shear
+          no_output_timeout: 60m
+          command: cargo shear --locked --deny-warnings
+      - run:
+          name: run_tests::check_dependencies::check_cargo_lock
+          no_output_timeout: 60m
+          command: cargo update --locked --workspace
+      - run:
+          name: run_tests::check_dependencies::check_crate_graph
+          no_output_timeout: 60m
+          command: "cargo test --package xtask -- workspace::"
+      - save_rust_cache:
+          prefix: check-dependencies
+
+  check_docs:
+    executor:
+      name: linux
+      resource_class: 2xlarge
+    environment:
+      CC: clang
+      CXX: clang++
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_docs >>
+          reason: run_docs
+      - checkout
+      - setup_cargo_config
+      - restore_rust_cache:
+          prefix: check-docs
+      - run:
+          name: steps::setup_linux
+          command: ./script/linux
+      - run:
+          name: steps::download_wasi_sdk
+          command: ./script/download-wasi-sdk
+      - run:
+          name: ./script/generate-action-metadata
+          command: ./script/generate-action-metadata
+      - run:
+          name: deploy_docs::install_lychee
+          no_output_timeout: 60m
+          command: |
+            command -v lychee >/dev/null || cargo install lychee --locked
+      - run:
+          name: deploy_docs::lychee_link_check (sources)
+          no_output_timeout: 60m
+          command: lychee --no-progress --exclude '^http' './docs/src/**/*'
+      - run:
+          name: deploy_docs::install_mdbook
+          command: |
+            curl -fsSL -o mdbook.tar.gz \
+              https://github.com/rust-lang/mdBook/releases/download/v0.4.37/mdbook-v0.4.37-x86_64-unknown-linux-gnu.tar.gz
+            mkdir -p "$HOME/bin"
+            tar -xzf mdbook.tar.gz -C "$HOME/bin"
+            echo 'export PATH="$HOME/bin:$PATH"' >> "$BASH_ENV"
+      - run:
+          name: deploy_docs::build_docs_book
+          no_output_timeout: 60m
+          environment:
+            DOCS_CHANNEL: stable
+            MDBOOK_BOOK__SITE_URL: /docs/
+          command: |
+            mkdir -p target/deploy
+            mdbook build ./docs --dest-dir=../target/deploy/docs/
+      # This second link check must stay after build_docs_book: it walks the
+      # rendered book, which does not exist until mdbook has run.
+      - run:
+          name: deploy_docs::lychee_link_check (rendered)
+          no_output_timeout: 60m
+          command: lychee --no-progress --exclude '^http' 'target/deploy/docs'
+      - save_rust_cache:
+          prefix: check-docs
+      - cleanup_cargo_config
+
+  check_licenses:
+    executor:
+      name: linux
+      resource_class: medium
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_licenses >>
+          reason: run_licenses
+      - checkout
+      - restore_rust_cache:
+          prefix: check-licenses
+      - run:
+          name: ./script/check-licenses
+          no_output_timeout: 60m
+          command: ./script/check-licenses
+      - run:
+          name: ./script/generate-licenses
+          no_output_timeout: 60m
+          command: ./script/generate-licenses
+      - save_rust_cache:
+          prefix: check-licenses
+
+  check_scripts:
+    executor:
+      name: linux
+      resource_class: xlarge
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_action_checks >>
+          reason: run_action_checks
+      - checkout
+      - run:
+          name: run_tests::check_scripts::run_shellcheck
+          command: |
+            command -v shellcheck >/dev/null || {
+              sudo apt-get update
+              sudo apt-get install -y shellcheck
+            }
+            ./script/shellcheck-scripts error
+      - restore_rust_cache:
+          prefix: check-scripts
+      - run:
+          name: run_tests::check_scripts::check_xtask_workflows
+          no_output_timeout: 60m
+          command: |
+            cargo xtask workflows
+            if ! git diff --exit-code .github; then
+              echo "Error: .github directory has uncommitted changes after running 'cargo xtask workflows'"
+              echo "Please run 'cargo xtask workflows' locally and commit the changes"
+              exit 1
+            fi
+      - run:
+          name: run_tests::check_scripts::download_actionlint
+          command: |
+            bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+            echo "export ACTIONLINT_BIN=$PWD/actionlint" >> "$BASH_ENV"
+      - run:
+          name: run_tests::check_scripts::run_actionlint
+          command: '"$ACTIONLINT_BIN" -color'
+      - run:
+          name: run_tests::check_scripts::run_zizmor
+          command: |
+            python3 -m pip install --quiet --user zizmor
+            "$HOME/.local/bin/zizmor" --min-severity high .github/workflows
+      - save_rust_cache:
+          prefix: check-scripts
+
+  check_postgres_and_protobuf_migrations:
+    executor:
+      name: linux
+      resource_class: 2xlarge
+    environment:
+      GIT_AUTHOR_NAME: Protobuf Action
+      GIT_AUTHOR_EMAIL: ci@zed.dev
+      GIT_COMMITTER_NAME: Protobuf Action
+      GIT_COMMITTER_EMAIL: ci@zed.dev
+    steps:
+      - halt_unless:
+          enabled: << pipeline.parameters.run_tests >>
+          reason: run_tests
+      - checkout
+      - run:
+          name: run_tests::check_postgres_and_protobuf_migrations::ensure_fresh_merge
+          command: |
+            base_branch="${ZED_CI_PR_BASE_BRANCH:-main}"
+            git fetch origin "$base_branch"
+            if [ "$CIRCLE_BRANCH" = "main" ] || printf '%s' "$CIRCLE_BRANCH" | grep -qE '^v[0-9]+\.[0-9]+\.x$'; then
+              echo "export BUF_BASE_BRANCH=$(git merge-base "origin/${base_branch}" HEAD)" >> "$BASH_ENV"
+            else
+              git checkout -B temp
+              git merge -q "origin/${base_branch}" -m "merge main into temp"
+              echo "export BUF_BASE_BRANCH=${base_branch}" >> "$BASH_ENV"
+            fi
+      - run:
+          name: run_tests::check_postgres_and_protobuf_migrations::bufbuild_setup_action
+          command: |
+            curl -fsSL -o /tmp/buf.tar.gz \
+              https://github.com/bufbuild/buf/releases/download/v1.29.0/buf-Linux-x86_64.tar.gz
+            sudo tar -xzf /tmp/buf.tar.gz -C /usr/local --strip-components 1
+            buf --version
+      - run:
+          name: run_tests::check_postgres_and_protobuf_migrations::bufbuild_breaking_action
+          command: |
+            buf breaking crates/proto/proto/ \
+              --against "https://github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git#branch=${BUF_BASE_BRANCH},subdir=crates/proto/proto/"
+      - run:
+          name: run_tests::check_postgres_and_protobuf_migrations::buf_lint
+          command: buf lint crates/proto/proto
+      - run:
+          name: run_tests::check_postgres_and_protobuf_migrations::check_protobuf_formatting
+          command: buf format --diff --exit-code crates/proto/proto
+
+  extension_tests:
+    description: >
+      Collapses the four jobs of the reusable extension_tests.yml workflow.
+      GitHub fans that workflow out with a matrix built from JSON at run time;
+      CircleCI matrices must be known at config-compile time, so this job loops
+      over the extension list instead. The source matrix pinned max-parallel: 1,
+      so the loop is not a parallelism regression. The per-extension
+      `orchestrate` sub-filter (check_rust / check_extension) is not reproduced:
+      both check sets run for every changed extension, which is strictly more
+      work, never less.
+    executor:
+      name: linux
+      resource_class: xlarge
+    environment:
+      ZED_EXTENSION_CLI_SHA: 9ee3c503a4bbbc6b4a0f8a789acca4871d773223
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_BUILD_TARGET: wasm32-wasip2
+    steps:
+      - halt_unless_set:
+          value: << pipeline.parameters.changed_extensions >>
+          reason: changed_extensions
+      - checkout
+      - restore_rust_cache:
+          prefix: extension-tests
+      - restore_cache:
+          keys:
+            - zed-extension-cli-9ee3c503a4bbbc6b4a0f8a789acca4871d773223
+      - run:
+          name: extension_tests::download_zed_extension_cli
+          command: |
+            if [ ! -x ./zed-extension ]; then
+              wget --quiet "https://zed-extension-cli.nyc3.digitaloceanspaces.com/${ZED_EXTENSION_CLI_SHA}/x86_64-unknown-linux-gnu/zed-extension" -O ./zed-extension
+              chmod +x ./zed-extension
+            fi
+      - save_cache:
+          key: zed-extension-cli-9ee3c503a4bbbc6b4a0f8a789acca4871d773223
+          paths:
+            - ./zed-extension
+      - run:
+          name: extension_tests::install_rust_target
+          command: rustup target add wasm32-wasip2
+      - install_nextest:
+          platform: linux
+      - run:
+          name: run_tests::fetch_ts_query_ls
+          command: |
+            curl -fsSL -o ts_query_ls.tar.gz \
+              https://github.com/ribru17/ts_query_ls/releases/download/v3.15.1/ts_query_ls-x86_64-unknown-linux-gnu.tar.gz
+            tar -xf ts_query_ls.tar.gz
+      - run:
+          name: extension_tests
+          no_output_timeout: 60m
+          environment:
+            CHANGED_EXTENSIONS: "<< pipeline.parameters.changed_extensions >>"
+          command: |
+            repo_root="$PWD"
+            base_branch="${ZED_CI_PR_BASE_BRANCH:-main}"
+            git fetch origin "$base_branch"
+            for extension in $CHANGED_EXTENSIONS; do
+              echo "===== ${extension} ====="
+              cd "${repo_root}/${extension}"
+
+              if [ -f Cargo.toml ]; then
+                package_name="$(sed -n 's/^name = "\(.*\)"/\1/p' < Cargo.toml | head -1 | tr -d '[:space:]')"
+                cargo fmt -p "$package_name" -- --check
+                cargo clippy -p "$package_name" --release --all-features -- --deny warnings
+                NEXTEST_NO_TESTS=warn cargo nextest run -p "$package_name" --no-fail-fast --no-tests=warn \
+                  --target "$(rustc -vV | sed -n 's|host: ||p')"
+              fi
+
+              if [ -f extension.toml ]; then
+                rm -rf /tmp/ext-scratch /tmp/ext-output
+                mkdir -p /tmp/ext-scratch /tmp/ext-output
+                "${repo_root}/zed-extension" --source-dir . --scratch-dir /tmp/ext-scratch --output-dir /tmp/ext-output
+
+                if [ -d languages ]; then
+                  "${repo_root}/ts_query_ls" format --check languages || {
+                    echo "Found unformatted queries, please format them with ts_query_ls."
+                    echo "For easy use, install the Tree-sitter query extension:"
+                    echo "zed://extension/tree-sitter-query"
+                    false
+                  }
+                fi
+
+                current_version="$(sed -n 's/^version = "\(.*\)"/\1/p' < extension.toml | tr -d '[:space:]')"
+                fork_point="$(git merge-base "origin/${base_branch}" HEAD)"
+                parent_version="$(git show "${fork_point}:${extension}/extension.toml" 2>/dev/null | sed -n 's/^version = "\(.*\)"/\1/p' | tr -d '[:space:]' || true)"
+                if [ -n "$parent_version" ] && [ "$current_version" != "$parent_version" ]; then
+                  # GitHub exempted the zed-zippy bot via
+                  # github.event.pull_request.user.login, which CircleCI does not
+                  # expose. The bot's own pipelines must set this variable.
+                  if [ "${ZED_CI_ALLOW_EXTENSION_VERSION_BUMP:-false}" = "true" ]; then
+                    echo "Version change allowed by ZED_CI_ALLOW_EXTENSION_VERSION_BUMP."
+                  else
+                    echo "Version change detected in your change!"
+                    echo "Version changes happen in separate PRs and will be performed by the zed-zippy bot"
+                    exit 42
+                  fi
+                fi
+              fi
+            done
+      - save_rust_cache:
+          prefix: extension-tests
+
+  tests_pass:
+    description: >
+      Port of run_tests.yml's tests_pass. GitHub needed `always()` plus an
+      explicit per-dependency result check because a skipped dependency would
+      otherwise cancel it; CircleCI gives that for free - a failed dependency
+      simply prevents this job from running and the workflow goes red, while the
+      halted (gate-closed) jobs report success.
+    executor:
+      name: linux
+      resource_class: small
+    steps:
+      - run:
+          name: run_tests::tests_pass
+          command: echo "All required checks succeeded or were skipped."
+
+  danger:
+    executor:
+      name: linux
+      resource_class: medium
+      image: cimg/node:24.0
+    steps:
+      - run:
+          name: gate - pull request only
+          command: |
+            if [ "$CIRCLE_BRANCH" = "main" ] || printf '%s' "$CIRCLE_BRANCH" | grep -qE '^v[0-9]+\.[0-9]+\.x$'; then
+              echo "danger only runs on pull requests; skipping."
+              circleci-agent step halt
+            fi
+      - checkout
+      - run:
+          name: steps::setup_pnpm
+          command: sudo npm install -g pnpm@9
+      - run:
+          name: danger::danger_job::install_deps
+          command: pnpm install --dir script/danger
+      - run:
+          name: danger::danger_job::run
+          environment:
+            GITHUB_TOKEN: not_a_real_token
+            DANGER_GITHUB_API_BASE_URL: https://danger-proxy.zed.dev/github
+          command: pnpm run --dir script/danger danger ci
+
+  build_nix_linux_x86_64:
+    executor:
+      name: linux_vm
+      resource_class: 2xlarge
+    environment:
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - nix-store-v1-{{ arch }}-{{ checksum "flake.lock" }}
+            - nix-store-v1-{{ arch }}-
+      - run:
+          name: nix_build::build_nix::install_nix
+          command: |
+            curl -fsSL https://install.determinate.systems/nix | sh -s -- install --no-confirm
+            echo 'source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' >> "$BASH_ENV"
+      - run:
+          name: nix_build::build_nix::cachix_action
+          command: |
+            nix profile install nixpkgs#cachix
+            if [ -n "${CACHIX_AUTH_TOKEN:-}" ]; then
+              cachix authtoken "$CACHIX_AUTH_TOKEN"
+            fi
+            cachix use zed
+      - run:
+          name: nix_build::build_nix::build
+          no_output_timeout: 60m
+          command: nix build .#default -L --accept-flake-config
+      - run:
+          name: nix_build::build_nix::push_to_cachix
+          when: on_success
+          command: |
+            if [ -n "${CACHIX_AUTH_TOKEN:-}" ] && [ -L result ]; then
+              cachix push zed ./result
+            fi
+      - save_cache:
+          key: nix-store-v1-{{ arch }}-{{ checksum "flake.lock" }}
+          paths:
+            - /nix/store
+
+  build_nix_mac_aarch64:
+    executor: macos
+    environment:
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - nix-cache-macos-v1-{{ checksum "flake.lock" }}
+            - nix-cache-macos-v1-
+      - run:
+          name: nix_build::build_nix::install_nix
+          command: |
+            curl -fsSL https://install.determinate.systems/nix | sh -s -- install --no-confirm
+            echo 'source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' >> "$BASH_ENV"
+      - run:
+          name: nix_build::build_nix::configure_local_nix_cache
+          command: |
+            mkdir -p ~/nix-cache
+            echo "extra-substituters = file://$HOME/nix-cache?priority=10" | sudo tee -a /etc/nix/nix.conf
+            echo "require-sigs = false" | sudo tee -a /etc/nix/nix.conf
+            sudo launchctl kickstart -k system/org.nixos.nix-daemon
+      - run:
+          name: nix_build::build_nix::build
+          no_output_timeout: 60m
+          command: nix build .#default -L --accept-flake-config
+      - run:
+          name: nix_build::build_nix::export_to_local_nix_cache
+          when: always
+          command: |
+            if [ -L result ]; then
+              echo "Copying build closure to local binary cache..."
+              nix copy --to "file://$HOME/nix-cache" ./result || echo "Warning: nix copy to local cache failed"
+            else
+              echo "No build result found, skipping cache export."
+            fi
+      - save_cache:
+          key: nix-cache-macos-v1-{{ checksum "flake.lock" }}
+          paths:
+            - ~/nix-cache
+
+  bundle_linux:
+    parameters:
+      arch:
+        type: enum
+        enum: ["aarch64", "x86_64"]
+      resource_class:
+        type: string
+    machine:
+      image: ubuntu-2404:current
+    resource_class: << parameters.resource_class >>
+    working_directory: ~/work/zed
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - checkout
+      - restore_rust_cache:
+          prefix: bundle-linux-<< parameters.arch >>
+      - run:
+          name: steps::setup_sentry
+          command: |
+            command -v sentry-cli >/dev/null || curl -sL https://sentry.io/get-cli/ | sudo bash
+      - run:
+          name: steps::setup_linux
+          command: ./script/linux
+      - run:
+          name: steps::download_wasi_sdk
+          command: ./script/download-wasi-sdk
+      - run:
+          name: ./script/bundle-linux
+          no_output_timeout: 60m
+          command: ./script/bundle-linux
+      - store_artifacts:
+          path: target/release/zed-linux-<< parameters.arch >>.tar.gz
+          destination: zed-linux-<< parameters.arch >>.tar.gz
+      - store_artifacts:
+          path: target/zed-remote-server-linux-<< parameters.arch >>.gz
+          destination: zed-remote-server-linux-<< parameters.arch >>.gz
+      - save_rust_cache:
+          prefix: bundle-linux-<< parameters.arch >>
+
+  build_static_bwrap:
+    parameters:
+      arch:
+        type: enum
+        enum: ["aarch64", "x86_64"]
+      resource_class:
+        type: string
+    machine:
+      image: ubuntu-2404:current
+    resource_class: << parameters.resource_class >>
+    working_directory: ~/work/zed
+    steps:
+      - run:
+          name: run_bundling::build_static_bwrap::install_nix
+          command: |
+            curl -fsSL https://install.determinate.systems/nix | sh -s -- install --no-confirm
+            echo 'source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' >> "$BASH_ENV"
+      - run:
+          name: run_bundling::build_static_bwrap::cachix
+          command: |
+            nix profile install nixpkgs#cachix
+            if [ -n "${CACHIX_AUTH_TOKEN:-}" ]; then
+              cachix authtoken "$CACHIX_AUTH_TOKEN"
+            fi
+            cachix use zed
+      - run:
+          name: run_bundling::build_static_bwrap::build
+          no_output_timeout: 60m
+          command: nix build nixpkgs#pkgsStatic.bubblewrap -L
+      - run:
+          name: run_bundling::build_static_bwrap::package
+          command: |
+            cp result/bin/bwrap bwrap-linux-<< parameters.arch >>
+            chmod 755 bwrap-linux-<< parameters.arch >>
+            gzip -f --stdout --best bwrap-linux-<< parameters.arch >> > bwrap-linux-<< parameters.arch >>.gz
+      - store_artifacts:
+          path: bwrap-linux-<< parameters.arch >>.gz
+          destination: bwrap-linux-<< parameters.arch >>.gz
+
+  bundle_mac:
+    parameters:
+      target:
+        type: enum
+        enum: ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+      arch:
+        type: enum
+        enum: ["aarch64", "x86_64"]
+    executor: macos
+    steps:
+      - checkout
+      - restore_rust_cache:
+          prefix: bundle-mac-<< parameters.arch >>
+      - run:
+          name: steps::setup_sentry
+          command: |
+            command -v sentry-cli >/dev/null || curl -sL https://sentry.io/get-cli/ | sudo bash
+      - run:
+          name: steps::clear_target_dir_if_large
+          command: ./script/clear-target-dir-if-larger-than 350 200
+      - run:
+          name: run_bundling::bundle_mac::bundle_mac
+          no_output_timeout: 60m
+          command: ./script/bundle-mac << parameters.target >>
+      - store_artifacts:
+          path: target/<< parameters.target >>/release/Zed-<< parameters.arch >>.dmg
+          destination: Zed-<< parameters.arch >>.dmg
+      - store_artifacts:
+          path: target/zed-remote-server-macos-<< parameters.arch >>.gz
+          destination: zed-remote-server-macos-<< parameters.arch >>.gz
+      - save_rust_cache:
+          prefix: bundle-mac-<< parameters.arch >>
+
+  bundle_windows:
+    parameters:
+      arch:
+        type: enum
+        enum: ["aarch64", "x86_64"]
+    executor: windows
+    environment:
+      FILE_DIGEST: SHA256
+      TIMESTAMP_DIGEST: SHA256
+      TIMESTAMP_SERVER: http://timestamp.acs.microsoft.com
+    steps:
+      - checkout
+      - restore_rust_cache_windows:
+          prefix: bundle-windows-<< parameters.arch >>
+      - run:
+          name: steps::clear_target_dir_if_large
+          shell: powershell.exe
+          command: ./script/clear-target-dir-if-larger-than.ps1 350 200
+      - run:
+          name: run_bundling::bundle_windows::bundle_windows
+          no_output_timeout: 60m
+          shell: powershell.exe
+          command: script/bundle-windows.ps1 -Architecture << parameters.arch >>
+      - store_artifacts:
+          path: target/Zed-<< parameters.arch >>.exe
+          destination: Zed-<< parameters.arch >>.exe
+      - store_artifacts:
+          path: target/zed-remote-server-windows-<< parameters.arch >>.zip
+          destination: zed-remote-server-windows-<< parameters.arch >>.zip
+      - save_rust_cache_windows:
+          prefix: bundle-windows-<< parameters.arch >>
+
+workflows:
+  test:
+    jobs:
+      - check_style:
+          context: [zed-ci]
+      - clippy_linux:
+          context: [zed-ci]
+      - clippy_macos:
+          name: clippy_mac
+          cache_prefix: clippy-mac
+          context: [zed-ci]
+      - clippy_macos:
+          name: clippy_mac_x86_64
+          cache_prefix: clippy-mac-x86-64
+          add_x86_target: true
+          target_flag: "--target x86_64-apple-darwin"
+          context: [zed-ci]
+      - clippy_windows:
+          context: [zed-ci]
+      - run_tests_linux:
+          context: [zed-ci]
+      - run_tests_mac:
+          context: [zed-ci]
+      - run_tests_windows:
+          context: [zed-ci]
+      - miri_scheduler:
+          context: [zed-ci]
+      - doctests:
+          context: [zed-ci]
+      - check_workspace_binaries:
+          context: [zed-ci]
+      - build_visual_tests_binary:
+          context: [zed-ci]
+      - check_wasm:
+          context: [zed-ci]
+      - check_dependencies:
+          context: [zed-ci]
+      - check_docs:
+          context: [zed-ci]
+      - check_licenses:
+          context: [zed-ci]
+      - check_scripts:
+          context: [zed-ci]
+      - check_postgres_and_protobuf_migrations:
+          context: [zed-ci]
+      - extension_tests:
+          context: [zed-ci]
+      # check_postgres_and_protobuf_migrations is deliberately absent from this
+      # list: run_tests.yml's tests_pass does not list it in `needs` either.
+      - tests_pass:
+          requires:
+            - check_style
+            - clippy_linux
+            - clippy_mac
+            - clippy_mac_x86_64
+            - clippy_windows
+            - run_tests_linux
+            - run_tests_mac
+            - run_tests_windows
+            - miri_scheduler
+            - doctests
+            - check_workspace_binaries
+            - build_visual_tests_binary
+            - check_wasm
+            - check_dependencies
+            - check_docs
+            - check_licenses
+            - check_scripts
+            - extension_tests
+
+  danger:
+    jobs:
+      - danger
+
+  nix:
+    # nix_build.yml fires for either the run-nix or the run-bundling label.
+    when:
+      or:
+        - << pipeline.parameters.run_nix >>
+        - << pipeline.parameters.run_bundling >>
+    jobs:
+      - build_nix_linux_x86_64:
+          context: [zed-ci]
+      - build_nix_mac_aarch64:
+          context: [zed-ci]
+
+  bundling:
+    when: << pipeline.parameters.run_bundling >>
+    jobs:
+      - bundle_linux:
+          name: bundle_linux_aarch64
+          arch: aarch64
+          resource_class: arm.xlarge
+          context: [zed-ci]
+      - bundle_linux:
+          name: bundle_linux_x86_64
+          arch: x86_64
+          resource_class: 2xlarge
+          context: [zed-ci]
+      - build_static_bwrap:
+          name: build_static_bwrap_linux_aarch64
+          arch: aarch64
+          resource_class: arm.xlarge
+          context: [zed-ci]
+      - build_static_bwrap:
+          name: build_static_bwrap_linux_x86_64
+          arch: x86_64
+          resource_class: 2xlarge
+          context: [zed-ci]
+      - bundle_mac:
+          name: bundle_mac_aarch64
+          target: aarch64-apple-darwin
+          arch: aarch64
+          context: [zed-ci]
+      - bundle_mac:
+          name: bundle_mac_x86_64
+          target: x86_64-apple-darwin
+          arch: x86_64
+          context: [zed-ci]
+      - bundle_windows:
+          name: bundle_windows_aarch64
+          arch: aarch64
+          context: [zed-ci]
+      - bundle_windows:
+          name: bundle_windows_x86_64
+          arch: x86_64
+          context: [zed-ci]

@@ -1,0 +1,96 @@
+# CircleCI translation of the code-verification GitHub Actions workflows.
+#
+# Source workflows: .github/workflows/run_tests.yml (+ the reusable
+# extension_tests.yml it calls), nix_build.yml, run_bundling.yml, danger.yml.
+#
+# This is a *setup* config. It exists only to run the port of run_tests.yml's
+# `orchestrate` job, which decides which checks are needed, and then hand a
+# parameter file to .circleci/continue_config.yml. GitHub Actions expresses this
+# with job `outputs` consumed by downstream `if:` expressions; CircleCI has no
+# cross-job outputs, so a setup pipeline plus pipeline parameters is the
+# equivalent mechanism.
+#
+# ---------------------------------------------------------------------------
+# Environment variables and secrets this pipeline depends on
+# ---------------------------------------------------------------------------
+# Provided by CircleCI:
+#   CIRCLE_PROJECT_USERNAME, CIRCLE_PROJECT_REPONAME, CIRCLE_BRANCH,
+#   CIRCLE_SHA1, CIRCLE_PULL_REQUEST, BASH_ENV
+#
+# Must be supplied by the `zed-ci` context (see continue_config.yml):
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY  - sccache on R2
+#   ZED_CLIENT_CHECKSUM_SEED, ZED_MINIDUMP_ENDPOINT        - bundling
+#   ZED_CLOUD_PROVIDER_ADDITIONAL_MODELS_JSON              - nix build
+#   SENTRY_AUTH_TOKEN                                      - bundling
+#   CACHIX_AUTH_TOKEN                                      - nix build
+#   MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD,
+#   APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID,
+#   APPLE_NOTARIZATION_ISSUER_ID                           - macOS bundling
+#   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#   ACCOUNT_NAME, CERT_PROFILE_NAME, ENDPOINT              - Windows signing
+#   DOCS_AMPLITUDE_API_KEY, DOCS_CONSENT_IO_INSTANCE       - docs build
+#
+# Optional overrides read by .circleci/compute-filters.sh:
+#   ZED_CI_OWNER_ALLOWLIST   default "zed-industries zed-extensions"
+#   ZED_CI_PR_BASE_BRANCH    default "main"
+# ---------------------------------------------------------------------------
+
+version: 2.1
+setup: true
+
+orbs:
+  continuation: circleci/continuation@1.1.0
+
+parameters:
+  # GitHub Actions triggers nix_build.yml / run_bundling.yml from the `run-nix`
+  # and `run-bundling` PR labels. CircleCI cannot read PR labels, so these are
+  # pipeline parameters set on an API trigger instead.
+  run_nix:
+    type: boolean
+    default: false
+  run_bundling:
+    type: boolean
+    default: false
+
+jobs:
+  orchestrate:
+    docker:
+      - image: cimg/rust:1.90
+    resource_class: medium
+    environment:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      ZED_CI_RUN_NIX: "<< pipeline.parameters.run_nix >>"
+      ZED_CI_RUN_BUNDLING: "<< pipeline.parameters.run_bundling >>"
+    steps:
+      # Every job in run_tests.yml carries
+      # `if: github.repository_owner == 'zed-industries' || ...` so that forks do
+      # not burn CI minutes. CircleCI has no such expression, and gating each
+      # job individually would still let the ungated ones (check_style,
+      # tests_pass) run. Halting the *setup* job means continuation/continue
+      # never fires and no continuation pipeline exists at all, which is what
+      # "every job skipped" looks like here. This must stay the first step.
+      - run:
+          name: gate - repository owner allowlist
+          command: |
+            allowlist="${ZED_CI_OWNER_ALLOWLIST:-zed-industries zed-extensions}"
+            for allowed in $allowlist; do
+              if [ "${CIRCLE_PROJECT_USERNAME:-}" = "$allowed" ]; then
+                exit 0
+              fi
+            done
+            echo "Repository owner '${CIRCLE_PROJECT_USERNAME:-}' is not in the allowlist (${allowlist}); skipping all checks."
+            circleci-agent step halt
+      - checkout
+      - run:
+          name: filter
+          command: .circleci/compute-filters.sh /tmp/pipeline-parameters.json
+      - continuation/continue:
+          configuration_path: .circleci/continue_config.yml
+          parameters: /tmp/pipeline-parameters.json
+
+workflows:
+  setup:
+    jobs:
+      - orchestrate
