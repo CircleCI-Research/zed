@@ -701,6 +701,19 @@ jobs:
           enabled: << pipeline.parameters.run_tests >>
           reason: run_tests
       - checkout
+      - run:
+          name: Install clang
+          command: |
+            # The source sets CC=clang but never installs it: it runs on
+            # namespace-profile-2x4-ubuntu-2404, a third-party runner image that
+            # ships clang preinstalled, so there is no install step in the
+            # workflow to port. cimg images do not, and cc-rs fails with
+            # 'failed to find tool "clang"' while building native crates.
+            command -v clang >/dev/null || {
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends clang
+            }
+            clang --version
       - restore_rust_cache:
           prefix: check-dependencies
       - run:
@@ -845,8 +858,16 @@ jobs:
       - run:
           name: run_tests::check_scripts::run_zizmor
           command: |
-            python3 -m pip install --quiet --user zizmor
-            "$HOME/.local/bin/zizmor" --min-severity high .github/workflows
+            # `python3 -m pip install --user` fails here with "No module named
+            # pip": the system interpreter carries neither pip nor, on 24.04,
+            # permission to install into it (PEP 668). Use an isolated venv.
+            if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends python3-venv
+            fi
+            python3 -m venv "$HOME/zizmor-venv"
+            "$HOME/zizmor-venv/bin/pip" install --quiet zizmor
+            "$HOME/zizmor-venv/bin/zizmor" --min-severity high .github/workflows
       - save_rust_cache:
           prefix: check-scripts
 
