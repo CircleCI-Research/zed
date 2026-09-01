@@ -70,7 +70,15 @@ executors:
   macos:
     macos:
       xcode: 16.4.0
-    resource_class: macos.m1.large.gen1
+    # `macos.m1.large.gen1` was rejected outright: "resource class
+    # macos.m1.large.gen1, image xcode:16.4.0 is not a valid resource class".
+    # CircleCI offers exactly two macOS classes now, m4pro.medium and
+    # m4pro.large; the gen-1 names are gone. `circleci config validate` cannot
+    # catch this -- it checks schema, not whether a class resolves. The source
+    # runs these jobs on namespace-profile-mac-large, a third-party runner with
+    # no CircleCI equivalent, so the class was invented rather than translated
+    # and there was nothing to check the invention against.
+    resource_class: m4pro.medium
     working_directory: ~/work/zed
     environment:
       CARGO_TERM_COLOR: always
@@ -517,6 +525,20 @@ jobs:
           reason: run_tests
       - checkout
       - setup_cargo_config_windows
+      - run:
+          name: steps::use_msvc_toolchain
+          shell: powershell.exe
+          command: |
+            # rust-toolchain.toml pins the channel (1.97.1) but not a host
+            # triple, so rustup resolves it against the machine's default host.
+            # On this image that is x86_64-pc-windows-gnu, whose linker needs
+            # dlltool.exe -- absent here, so every cargo build died with "error
+            # calling dlltool 'dlltool.exe': program not found". zed's own
+            # runner (self-32vcpu-windows-2022) defaults to msvc, so the source
+            # never had to say so and there was nothing to port.
+            rustup set default-host x86_64-pc-windows-msvc
+            rustup toolchain install 1.97.1 --profile minimal
+            rustc -vV
       - restore_rust_cache_windows:
           prefix: tests-windows
       - run:
@@ -530,8 +552,14 @@ jobs:
           no_output_timeout: 60m
           shell: powershell.exe
           command: |
+            # Download the prebuilt binary rather than compiling it, which
+            # is what the Linux and macOS paths in this config already do.
             if (-not (Get-Command cargo-nextest -ErrorAction SilentlyContinue)) {
-              cargo install cargo-nextest --locked
+              $tmp = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$', 'zip' } -PassThru
+              Invoke-WebRequest -OutFile $tmp https://get.nexte.st/latest/windows
+              $outputDir = if ($Env:CARGO_HOME) { Join-Path $Env:CARGO_HOME "bin" } else { "~/.cargo/bin" }
+              $tmp | Expand-Archive -DestinationPath $outputDir -Force
+              $tmp | Remove-Item
             }
       - run:
           name: steps::setup_sccache and steps::cargo_nextest
