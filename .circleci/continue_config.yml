@@ -112,16 +112,18 @@ executors:
       RUST_BACKTRACE: "1"
 
 commands:
-  install_rust_macos:
+  install_macos_build_deps:
     description: >
-      The macOS executor is a bare Xcode VM with no Rust toolchain. The linux
-      executor gets one from cimg/rust and the Windows image ships rustup, but
-      macOS has neither, so every cargo/rustup call failed with "command not
-      found". The source has no install step to port: its mac jobs run on
-      namespace-profile-mac-large, a third-party runner whose image carries
-      Rust already, so the dependency never appears in the workflow.
-      rust-toolchain.toml pins the channel, components and targets, so `rustup
-      show` inside the repo provisions exactly what the build expects.
+      CircleCI's Xcode image is scoped to Apple development. Its manifest is
+      Ruby, Python, Node, Fastlane, CocoaPods, Java and Xcode -- no Rust and no
+      cmake. GitHub's hosted macOS runners are general-purpose CI images and
+      carry both (cmake 4.4.0 and, notably, Rust 1.97.1, the exact version
+      rust-toolchain.toml pins), and the source's own runner
+      namespace-profile-mac-large likewise supplies them. So neither
+      dependency appears anywhere in run_tests.yml and there was no install
+      step to port. They surface one at a time, each hidden behind the last:
+      first "cargo: command not found", then a panic inside
+      wasmtime-c-api-impl's build script when it spawns cmake. Install both.
     steps:
       - run:
           name: steps::install_rust
@@ -138,6 +140,17 @@ commands:
             # components and targets.
             rustup show
             cargo --version
+      - run:
+          name: steps::install_cmake
+          no_output_timeout: 20m
+          command: |
+            # wasmtime-c-api-impl's build.rs spawns cmake directly and panics
+            # with `failed to spawn "cmake": NotFound` when it is absent.
+            # Homebrew is preinstalled on the Xcode image; cmake is not.
+            if ! command -v cmake >/dev/null 2>&1; then
+              HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake
+            fi
+            cmake --version
 
   halt_unless:
     description: >
@@ -459,7 +472,7 @@ jobs:
           enabled: << pipeline.parameters.run_tests >>
           reason: run_tests
       - checkout
-      - install_rust_macos
+      - install_macos_build_deps
       - setup_cargo_config
       - restore_rust_cache:
           prefix: << parameters.cache_prefix >>
@@ -543,7 +556,11 @@ jobs:
               sudo apt-get update -qq
               sudo apt-get install -y --no-install-recommends rsync
             fi
-            rsync --version | head -1
+            # Not `rsync --version | head -1`: CircleCI runs steps under
+            # `bash -eo pipefail`, so head closing the pipe early makes rsync
+            # die of SIGPIPE and the step exit 141 despite a clean install.
+            # GitHub Actions uses `bash -e` without pipefail, where it is safe.
+            rsync --version
       - run:
           name: steps::download_wasi_sdk
           command: ./script/download-wasi-sdk
@@ -574,7 +591,7 @@ jobs:
           enabled: << pipeline.parameters.run_tests >>
           reason: run_tests
       - checkout
-      - install_rust_macos
+      - install_macos_build_deps
       - setup_cargo_config
       - restore_rust_cache:
           prefix: tests-mac
@@ -750,7 +767,7 @@ jobs:
           enabled: << pipeline.parameters.run_tests >>
           reason: run_tests
       - checkout
-      - install_rust_macos
+      - install_macos_build_deps
       - setup_cargo_config
       - restore_rust_cache:
           prefix: visual-tests
@@ -1340,7 +1357,7 @@ jobs:
     executor: macos
     steps:
       - checkout
-      - install_rust_macos
+      - install_macos_build_deps
       - restore_rust_cache:
           prefix: bundle-mac-<< parameters.arch >>
       - run:
