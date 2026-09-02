@@ -112,6 +112,33 @@ executors:
       RUST_BACKTRACE: "1"
 
 commands:
+  install_rust_macos:
+    description: >
+      The macOS executor is a bare Xcode VM with no Rust toolchain. The linux
+      executor gets one from cimg/rust and the Windows image ships rustup, but
+      macOS has neither, so every cargo/rustup call failed with "command not
+      found". The source has no install step to port: its mac jobs run on
+      namespace-profile-mac-large, a third-party runner whose image carries
+      Rust already, so the dependency never appears in the workflow.
+      rust-toolchain.toml pins the channel, components and targets, so `rustup
+      show` inside the repo provisions exactly what the build expects.
+    steps:
+      - run:
+          name: steps::install_rust
+          no_output_timeout: 30m
+          command: |
+            if ! command -v rustup >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --no-modify-path
+            fi
+            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
+            # shellcheck disable=SC1090
+            . "$BASH_ENV"
+            # Reads rust-toolchain.toml and installs the pinned channel,
+            # components and targets.
+            rustup show
+            cargo --version
+
   halt_unless:
     description: >
       Emulates a GitHub Actions job-level `if:`. CircleCI rejects `when:` on a
@@ -291,6 +318,20 @@ commands:
       run_tests.yml. The filterset is passed through an environment variable
       rather than spliced into the command line so that its parentheses and
       pipes are never re-parsed by the shell.
+    parameters:
+      test_threads:
+        description: >
+          Concurrent test threads, or empty to use nextest's own default of
+          "one per detected CPU". Pass an explicit count on Docker executors:
+          CPU detection there reports the *host's* core count, not the
+          container's cgroup limit, so nextest silently runs about twice the
+          intended number of tests at once. That does not fail outright, it
+          just halves the speed of every test — which pushes anything near
+          `.config/nextest.toml`'s 60s `slow-timeout` over the line. VM
+          executors (macOS, machine) see their real allotment and need no
+          override.
+        type: string
+        default: ""
     steps:
       - run:
           name: steps::cargo_nextest
@@ -300,11 +341,20 @@ commands:
           no_output_timeout: 60m
           environment:
             CHANGED_PACKAGES: "<< pipeline.parameters.changed_packages >>"
+            TEST_THREADS: "<< parameters.test_threads >>"
           command: |
-            if [ -n "$CHANGED_PACKAGES" ]; then
-              cargo nextest run --workspace --no-fail-fast --no-tests=warn -E "$CHANGED_PACKAGES"
+            if [ -n "$TEST_THREADS" ]; then
+              set -- --test-threads "$TEST_THREADS"
+              echo "Pinning nextest to $TEST_THREADS threads; this executor reports" \
+                   "$(nproc) CPUs but is limited to fewer."
             else
-              cargo nextest run --workspace --no-fail-fast --no-tests=warn
+              set --
+            fi
+            if [ -n "$CHANGED_PACKAGES" ]; then
+              cargo nextest run --workspace --no-fail-fast --no-tests=warn \
+                "$@" -E "$CHANGED_PACKAGES"
+            else
+              cargo nextest run --workspace --no-fail-fast --no-tests=warn "$@"
             fi
 
 jobs:
@@ -409,6 +459,7 @@ jobs:
           enabled: << pipeline.parameters.run_tests >>
           reason: run_tests
       - checkout
+      - install_rust_macos
       - setup_cargo_config
       - restore_rust_cache:
           prefix: << parameters.cache_prefix >>
@@ -481,6 +532,19 @@ jobs:
           name: steps::setup_linux
           command: ./script/linux
       - run:
+          # auto_update::tests::test_auto_update_downloads calls
+          # which::which("rsync") and fails when the binary is absent.
+          # script/linux does not install it and cimg/rust does not ship it;
+          # the source's namespace-profile-16x32 runner has it preinstalled, so
+          # the dependency is invisible in run_tests.yml.
+          name: steps::install_rsync
+          command: |
+            if ! command -v rsync >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends rsync
+            fi
+            rsync --version | head -1
+      - run:
           name: steps::download_wasi_sdk
           command: ./script/download-wasi-sdk
       - install_nextest:
@@ -489,7 +553,15 @@ jobs:
           name: steps::clear_target_dir_if_large
           command: ./script/clear-target-dir-if-larger-than 350 200
       - setup_sccache
-      - cargo_nextest_run
+      - cargo_nextest_run:
+          # 2xlarge is 16 cores, matching the source's
+          # namespace-profile-16x32-ubuntu-2204. But this is a Docker executor,
+          # so nextest's CPU detection saw the host instead: the previous run
+          # peaked at 30.7 cores of a 16-core limit (192%) and 91% of memory,
+          # i.e. ~32 tests in flight where 16 were intended. Nothing errored;
+          # every test just ran at half speed, and the three that time out at
+          # exactly 60.0s are the ones that sat closest to the limit.
+          test_threads: "16"
       - show_sccache_stats
       - save_rust_cache:
           prefix: tests-linux
@@ -502,6 +574,7 @@ jobs:
           enabled: << pipeline.parameters.run_tests >>
           reason: run_tests
       - checkout
+      - install_rust_macos
       - setup_cargo_config
       - restore_rust_cache:
           prefix: tests-mac
@@ -677,6 +750,7 @@ jobs:
           enabled: << pipeline.parameters.run_tests >>
           reason: run_tests
       - checkout
+      - install_rust_macos
       - setup_cargo_config
       - restore_rust_cache:
           prefix: visual-tests
@@ -1266,6 +1340,7 @@ jobs:
     executor: macos
     steps:
       - checkout
+      - install_rust_macos
       - restore_rust_cache:
           prefix: bundle-mac-<< parameters.arch >>
       - run:
