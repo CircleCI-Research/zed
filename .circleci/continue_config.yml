@@ -601,6 +601,30 @@ jobs:
           name: steps::clear_target_dir_if_large
           command: ./script/clear-target-dir-if-larger-than 350 200
       - setup_sccache
+      - run:
+          # collab_tests::editor_tests::test_collaborating_with_editorconfig
+          # drives 21 seeds in a single process, each building a TestServer
+          # with its own Tokio runtime, and died on seed 20 with "Failed to
+          # initialize Tokio: ... Too many open files" (EMFILE). The
+          # descriptors accumulate across seeds until the process hits its
+          # soft limit, and macOS defaults that limit far lower than the Linux
+          # images do -- the same test passes on run_tests_linux. The source's
+          # namespace-profile-mac-large runner comes with a raised limit, so
+          # run_tests.yml has no ulimit call to port.
+          #
+          # $BASH_ENV is CircleCI's analogue of $GITHUB_ENV and is sourced by
+          # each later step's shell, which is what carries the new limit into
+          # the shell nextest runs in. Setting it here would not survive the
+          # step boundary.
+          name: steps::raise_fd_limit
+          command: |
+            hard=$(ulimit -H -n)
+            want=10240
+            if [ "$hard" != "unlimited" ] && [ "$hard" -lt "$want" ]; then
+              want="$hard"
+            fi
+            echo "ulimit -n $want" >> "$BASH_ENV"
+            echo "fd limit: soft was $(ulimit -S -n), hard is $hard, raising to $want"
       - cargo_nextest_run
       - show_sccache_stats
       - save_rust_cache:
