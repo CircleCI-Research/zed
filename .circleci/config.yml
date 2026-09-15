@@ -156,6 +156,20 @@ jobs:
           name: Install Linux system dependencies (script/linux)
           command: bash script/linux
           no_output_timeout: 20m
+      - run:
+          # script/linux installs both gcc/g++ and clang/lld/llvm, but
+          # doesn't set either as the default `cc`/`c++` alternative —
+          # Ubuntu 22.04 defaults those to GCC. webrtc-sys's build passes
+          # clang-only flags (-Wno-changes-meaning) to whatever `c++`
+          # resolves to; under GCC that flag is simply unrecognized, which
+          # then surfaces the -fpermissive error it was meant to suppress
+          # ("declaration of ... changes meaning of 'Network'"). Confirmed
+          # by an actual run (pipeline ebef2694-e51d-4164-829e-80de22fa40c9,
+          # job clippy). Point the build at clang explicitly instead.
+          name: Use clang as the C/C++ compiler
+          command: |
+            echo 'export CC=clang' >> "$BASH_ENV"
+            echo 'export CXX=clang++' >> "$BASH_ENV"
       - install_rust_toolchain
       - restore_cargo_cache:
           os: linux
@@ -194,9 +208,19 @@ jobs:
     # software Vulkan ICD (lavapipe) is installed defensively below. If
     # tests still fail here for want of a display, this job needs revisiting
     # (e.g. xvfb-run) once it has actually been run once.
+    #
+    # CARGO_PROFILE_TEST_DEBUG=0: `cargo test --workspace` across 243 crates
+    # produces one debug test binary per crate, many statically linking the
+    # same huge webrtc-sys/wgpu libraries — with full debug info this ran
+    # the macOS test job out of disk (`No space left on device`, confirmed
+    # on pipeline ebef2694-e51d-4164-829e-80de22fa40c9, job test_macos), and
+    # macOS's disk allocation doesn't grow with a bigger resource class.
+    # Applied on every OS pre-emptively since the risk isn't OS-specific.
     machine:
       image: ubuntu-2204:current
     resource_class: xlarge
+    environment:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - checkout
       - run:
@@ -212,6 +236,12 @@ jobs:
       - run:
           name: Install software Vulkan driver for GPU-less CI (lavapipe)
           command: sudo apt-get install -y mesa-vulkan-drivers
+      - run:
+          # See the identical step in the clippy job for why.
+          name: Use clang as the C/C++ compiler
+          command: |
+            echo 'export CC=clang' >> "$BASH_ENV"
+            echo 'export CXX=clang++' >> "$BASH_ENV"
       - install_rust_toolchain
       - restore_cargo_cache:
           os: linux
@@ -282,9 +312,19 @@ jobs:
     # (pipeline a1fbb638-0ae2-4264-88c9-cb6402ae4444, job
     # build_and_test_macos). Splitting keeps each job's on-disk footprint to
     # one build profile at a time.
+    #
+    # That alone wasn't enough, though: even in this now-isolated job,
+    # `cargo test --workspace` still ran out of disk on its own (confirmed
+    # on pipeline ebef2694-e51d-4164-829e-80de22fa40c9) — 243 crates' worth
+    # of debug test binaries, many statically linking the same huge
+    # webrtc-sys/wgpu libraries, is enough on its own. CARGO_PROFILE_TEST_DEBUG=0
+    # strips debug info from those binaries; macOS's disk allocation doesn't
+    # grow with resource_class, so a bigger machine wouldn't have helped.
     macos:
       xcode: 16.4.0
     resource_class: m4pro.medium
+    environment:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - checkout
       - run:
@@ -331,10 +371,21 @@ jobs:
     # that needs cargo/cmake re-adds their install dirs to $env:PATH itself
     # rather than relying on choco's system-PATH registry write (which a
     # freshly spawned step process is not guaranteed to pick up).
+    #
+    # CARGO_NET_GIT_FETCH_WITH_CLI: cargo's bundled libgit2/libssh2 failed to
+    # complete an SSH key exchange with GitHub when fetching git
+    # dependencies on this image ("Unable to exchange encryption keys",
+    # confirmed on pipeline ebef2694-e51d-4164-829e-80de22fa40c9, job
+    # clippy_windows) — Linux/macOS fetched the same dependencies fine, so
+    # this is specific to whatever libssh2 build ships in this toolchain on
+    # Windows. Shelling out to the system git CLI (present on this image)
+    # sidesteps it, per the fix the error message itself points at.
     resource_class: windows.xlarge
     machine:
       image: windows-server-2022-gui:current
       shell: powershell.exe -ExecutionPolicy Bypass
+    environment:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - checkout
       - run:
@@ -364,10 +415,16 @@ jobs:
     # test_macos/clippy_macos: coexisting release + debug target/ output in
     # one job exhausted disk on macOS (ENOSPC during linking) in an earlier
     # combined version, and the risk is identical here.
+    #
+    # CARGO_NET_GIT_FETCH_WITH_CLI, CARGO_PROFILE_TEST_DEBUG: see the
+    # identical settings on clippy_windows / test_macos for why.
     resource_class: windows.xlarge
     machine:
       image: windows-server-2022-gui:current
       shell: powershell.exe -ExecutionPolicy Bypass
+    environment:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - checkout
       - run:
