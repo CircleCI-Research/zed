@@ -193,11 +193,16 @@ jobs:
   test_linux:
     # `cargo test --workspace` in default (non-release) config.
     #
-    # crates/collab's tests default to an in-memory SQLite database
-    # (TestServer::start picks TestDb::sqlite() unless USE_POSTGRES=true),
-    # so no Postgres service container is provisioned here. The
-    # Postgres-backed variant (USE_POSTGRES=true) is NOT covered by this
-    # job — see session summary.
+    # crates/collab has two separate test-DB mechanisms: TestServer::start
+    # (integration tests) defaults to in-memory SQLite unless USE_POSTGRES=true,
+    # but db_tests.rs's `test_both_dbs!` macro unconditionally generates an
+    # additional `_postgres`-suffixed variant of each test on Linux
+    # regardless of that env var. An earlier run without a Postgres server
+    # confirmed every `_postgres` test failing (pipeline
+    # 0d27d8ee-f08a-4924-a692-496971f1dd9f, job test_linux) while every
+    # other test passed — a real Postgres server is provisioned below via
+    # Docker (already available on this machine executor) specifically for
+    # those.
     #
     # ASSUMPTION (unverified — no CircleCI account access to actually run
     # this): most `#[gpui::test]`s run against gpui's mocked TestPlatform,
@@ -209,18 +214,28 @@ jobs:
     # tests still fail here for want of a display, this job needs revisiting
     # (e.g. xvfb-run) once it has actually been run once.
     #
-    # CARGO_PROFILE_TEST_DEBUG=0: `cargo test --workspace` across 243 crates
-    # produces one debug test binary per crate, many statically linking the
-    # same huge webrtc-sys/wgpu libraries — with full debug info this ran
-    # the macOS test job out of disk (`No space left on device`, confirmed
-    # on pipeline ebef2694-e51d-4164-829e-80de22fa40c9, job test_macos), and
-    # macOS's disk allocation doesn't grow with a bigger resource class.
+    # CARGO_PROFILE_TEST_DEBUG=0, CARGO_INCREMENTAL=0: `cargo test
+    # --workspace` across 243 crates produces one debug test binary per
+    # crate, many statically linking the same huge webrtc-sys/wgpu
+    # libraries — this ran macOS's test job out of disk twice (once from
+    # debug info, then again from incremental-compilation artifacts even
+    # with debug info stripped; pipelines ebef2694-e51d-4164-829e-80de22fa40c9
+    # and 0d27d8ee-f08a-4924-a692-496971f1dd9f, job test_macos both times),
+    # and macOS's disk allocation doesn't grow with a bigger resource class.
     # Applied on every OS pre-emptively since the risk isn't OS-specific.
+    #
+    # RUST_LOG=warn: collab's tests log every SQL query and RPC message at
+    # INFO level; a prior run's real cargo-test output was silently
+    # truncated by CircleCI's 50MB-per-step output cap before reaching the
+    # actual failure summary because of this. Quieting it keeps genuine
+    # failures visible instead of buried under query logs.
     machine:
       image: ubuntu-2204:current
     resource_class: xlarge
     environment:
       CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      RUST_LOG: warn
     steps:
       - checkout
       - run:
@@ -242,6 +257,20 @@ jobs:
           command: |
             echo 'export CC=clang' >> "$BASH_ENV"
             echo 'export CXX=clang++' >> "$BASH_ENV"
+      - run:
+          # crates/collab/tests/integration/db_tests.rs's TestDb::postgres()
+          # connects to postgres://postgres@localhost/zed-test-<random> with
+          # no password and needs CREATE DATABASE — trust auth on a throwaway
+          # container satisfies that without touching real credentials.
+          name: Start Postgres for collab's Postgres-variant tests
+          command: |
+            docker run -d --name zed-test-postgres -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:15
+            for i in $(seq 1 30); do
+              docker exec zed-test-postgres pg_isready -U postgres && exit 0
+              sleep 1
+            done
+            echo "Postgres did not become ready in time" >&2
+            exit 1
       - install_rust_toolchain
       - restore_cargo_cache:
           os: linux
@@ -320,11 +349,20 @@ jobs:
     # webrtc-sys/wgpu libraries, is enough on its own. CARGO_PROFILE_TEST_DEBUG=0
     # strips debug info from those binaries; macOS's disk allocation doesn't
     # grow with resource_class, so a bigger machine wouldn't have helped.
+    #
+    # Even that wasn't enough a second time: with debug info gone, the job
+    # instead ran out of disk writing incremental-compilation artifacts
+    # under target/debug/incremental/ (confirmed on pipeline
+    # 0d27d8ee-f08a-4924-a692-496971f1dd9f — "IO failure on output stream:
+    # No space left on device" while writing a dep-graph.part.bin file).
+    # Incremental compilation buys nothing in a single-shot CI job anyway,
+    # so it's disabled outright rather than chasing its disk usage further.
     macos:
       xcode: 16.4.0
     resource_class: m4pro.medium
     environment:
       CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - checkout
       - run:
@@ -389,6 +427,23 @@ jobs:
     steps:
       - checkout
       - run:
+          # docs/src/development/windows.md lists this as a required VS
+          # component; the windows-server-2022-gui image's VS Build Tools
+          # install doesn't include it, which fails a downstream crate's
+          # build script ("No spectre-mitigated libs were found", confirmed
+          # on pipeline 0d27d8ee-f08a-4924-a692-496971f1dd9f, job
+          # clippy_windows) rather than failing cleanly up front.
+          name: Add missing VS component (Spectre-mitigated libs)
+          command: |
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $vsPath = & $vsWhere -latest -property installationPath
+            & $vsInstaller modify --installPath "$vsPath" --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart --wait
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+              Write-Error "vs_installer modify failed with exit code $LASTEXITCODE"
+              exit 1
+            }
+      - run:
           name: Install cmake (docs/src/development/windows.md)
           command: choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
       - install_rust_toolchain_windows
@@ -416,8 +471,9 @@ jobs:
     # one job exhausted disk on macOS (ENOSPC during linking) in an earlier
     # combined version, and the risk is identical here.
     #
-    # CARGO_NET_GIT_FETCH_WITH_CLI, CARGO_PROFILE_TEST_DEBUG: see the
-    # identical settings on clippy_windows / test_macos for why.
+    # CARGO_NET_GIT_FETCH_WITH_CLI, CARGO_PROFILE_TEST_DEBUG,
+    # CARGO_INCREMENTAL: see the identical settings on clippy_windows /
+    # test_macos for why.
     resource_class: windows.xlarge
     machine:
       image: windows-server-2022-gui:current
@@ -425,8 +481,21 @@ jobs:
     environment:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - checkout
+      - run:
+          # See the identical step in the clippy_windows job for why.
+          name: Add missing VS component (Spectre-mitigated libs)
+          command: |
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $vsPath = & $vsWhere -latest -property installationPath
+            & $vsInstaller modify --installPath "$vsPath" --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart --wait
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+              Write-Error "vs_installer modify failed with exit code $LASTEXITCODE"
+              exit 1
+            }
       - run:
           name: Install cmake (docs/src/development/windows.md)
           command: choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
