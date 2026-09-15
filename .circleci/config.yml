@@ -1,0 +1,306 @@
+# CircleCI configuration for Zed.
+#
+# No existing CI config was found in this repo (see PR/session notes), so this
+# was derived directly from the repo's own tooling:
+#   - rust-toolchain.toml   -> exact toolchain channel, components, targets
+#   - script/linux          -> Linux system dependencies + rustup bootstrap
+#   - script/clippy         -> the project's own lint invocation
+#   - script/check-licenses -> the project's own license-header check
+#   - crates/collab/tests   -> default SQLite-backed test path (see comment
+#                              on the `test` job below)
+#
+# Assumptions that could not be verified without an actual CircleCI run (no
+# account access from this environment) are called out inline. See the
+# session summary for the full list.
+#
+# No secrets/credentials are required for any job below: all crates.io/registry
+# access is anonymous, and the default test path does not talk to any service.
+
+version: 2.1
+
+commands:
+  install_rust_toolchain:
+    description: >
+      Install rustup (if missing) and provision the exact toolchain pinned in
+      rust-toolchain.toml (channel, components, and targets are read from
+      that file automatically by `rustup show`, so this stays in sync with
+      the pin instead of duplicating the version here).
+    steps:
+      - run:
+          name: Install rustup
+          command: |
+            if ! command -v rustup >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+            fi
+            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
+      - run:
+          name: Provision pinned toolchain (rust-toolchain.toml)
+          command: rustup show
+
+  restore_cargo_cache:
+    description: >
+      Restore the cargo registry/git cache for this Cargo.lock. Keyed per-OS
+      because registry contents (compressed .crate files) are the same
+      across platforms, but keeping caches fully separate avoids any risk of
+      a cache built on one OS/base-image being restored onto another.
+    parameters:
+      os:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - v1-cargo-registry-<< parameters.os >>-{{ checksum "Cargo.lock" }}
+            - v1-cargo-registry-<< parameters.os >>-
+
+  save_cargo_cache:
+    description: Save the cargo registry/git cache.
+    parameters:
+      os:
+        type: string
+    steps:
+      - save_cache:
+          key: v1-cargo-registry-<< parameters.os >>-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+
+jobs:
+  check_fmt:
+    # Formatting only needs rustfmt against source text, not a full native
+    # toolchain, so this runs in a small docker executor instead of the
+    # heavier machine executor used by clippy/test.
+    docker:
+      - image: cimg/base:2024.02
+    resource_class: small
+    steps:
+      - checkout
+      - install_rust_toolchain
+      - run:
+          name: cargo fmt --check
+          command: cargo fmt --check
+
+  check_licenses:
+    # Pure bash/git script, no cargo or system deps required.
+    docker:
+      - image: cimg/base:2024.02
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: script/check-licenses
+          command: script/check-licenses
+
+  clippy:
+    # script/clippy runs `cargo clippy --workspace --release --all-targets
+    # --all-features`, which compiles every first-party crate including
+    # native GUI backends (webrtc-sys, wgpu, etc). That needs the real
+    # system libraries script/linux installs, and enough CPU/RAM that a
+    # docker executor's visible-vs-allocated CPU mismatch would be
+    # dangerous here, so this uses a machine executor (accurate CPU
+    # visibility, real sudo) sized generously.
+    machine:
+      image: ubuntu-2204:current
+    resource_class: xlarge
+    steps:
+      - checkout
+      - run:
+          name: Install Linux system dependencies (script/linux)
+          command: bash script/linux
+      - install_rust_toolchain
+      - restore_cargo_cache:
+          os: linux
+      - restore_cache:
+          keys:
+            - v1-clippy-target-linux-{{ checksum "Cargo.lock" }}
+      - run:
+          name: script/clippy
+          command: script/clippy
+          # A full --release --all-features --all-targets workspace build
+          # can go quiet for well over the platform's default ~10 minute
+          # per-step silence timeout on a cold cache.
+          no_output_timeout: 45m
+      - save_cargo_cache:
+          os: linux
+      - save_cache:
+          key: v1-clippy-target-linux-{{ checksum "Cargo.lock" }}
+          paths:
+            - target
+
+  test_linux:
+    # `cargo test --workspace` in default (non-release) config.
+    #
+    # crates/collab's tests default to an in-memory SQLite database
+    # (TestServer::start picks TestDb::sqlite() unless USE_POSTGRES=true),
+    # so no Postgres service container is provisioned here. The
+    # Postgres-backed variant (USE_POSTGRES=true) is NOT covered by this
+    # job — see session summary.
+    #
+    # ASSUMPTION (unverified — no CircleCI account access to actually run
+    # this): most `#[gpui::test]`s run against gpui's mocked TestPlatform,
+    # not a real display. But crates/gpui_wgpu and the platform-native gpui
+    # crates have their own #[test]s that may try to initialize a real
+    # Vulkan/GL device, and this CI machine has no GPU. `libvulkan1` from
+    # script/linux is only the loader, not a software driver, so a
+    # software Vulkan ICD (lavapipe) is installed defensively below. If
+    # tests still fail here for want of a display, this job needs revisiting
+    # (e.g. xvfb-run) once it has actually been run once.
+    machine:
+      image: ubuntu-2204:current
+    resource_class: xlarge
+    steps:
+      - checkout
+      - run:
+          name: Install Linux system dependencies (script/linux)
+          command: bash script/linux
+      - run:
+          name: Install software Vulkan driver for GPU-less CI (lavapipe)
+          command: sudo apt-get install -y mesa-vulkan-drivers
+      - install_rust_toolchain
+      - restore_cargo_cache:
+          os: linux
+      - restore_cache:
+          keys:
+            - v1-test-target-linux-{{ checksum "Cargo.lock" }}
+      - run:
+          name: cargo test --workspace
+          command: cargo test --workspace --no-fail-fast
+          no_output_timeout: 45m
+      - save_cargo_cache:
+          os: linux
+      - save_cache:
+          key: v1-test-target-linux-{{ checksum "Cargo.lock" }}
+          paths:
+            - target
+
+  build_and_test_macos:
+    # macOS coverage exists specifically so that crates/gpui_macos and
+    # crates/gpui_apple (Metal backends, whole-crate #![cfg(target_os =
+    # "macos")]) actually get compiled, linted, and tested at all — on
+    # Linux they are cfg'd out to an empty no-op shell, so Linux clippy/test
+    # never touches that code.
+    #
+    # Xcode version and resource_class are chosen from CircleCI's currently
+    # documented macOS support (Apple silicon only; Intel resource classes
+    # were deprecated) as of this writing, but neither was pinned by the
+    # repo itself (docs/src/development/macos.md doesn't pin an Xcode
+    # version) — ASSUMPTION: confirm `xcode: 16.4.0` and `m4pro.medium` are
+    # still valid/available on your CircleCI plan before relying on this.
+    macos:
+      xcode: 16.4.0
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - run:
+          # docs/src/development/macos.md notes this may be required for
+          # some bindgen-based build scripts to find the macOS SDK headers.
+          name: Set BINDGEN_EXTRA_CLANG_ARGS from active SDK
+          command: |
+            echo "export BINDGEN_EXTRA_CLANG_ARGS=\"--sysroot=$(xcrun --show-sdk-path)\"" >> "$BASH_ENV"
+      - run:
+          name: Install cmake (docs/src/development/macos.md)
+          command: brew install cmake
+      - install_rust_toolchain
+      - restore_cargo_cache:
+          os: macos
+      - restore_cache:
+          keys:
+            - v1-clippy-target-macos-{{ checksum "Cargo.lock" }}
+      - run:
+          name: script/clippy
+          command: script/clippy
+          no_output_timeout: 45m
+      - save_cache:
+          key: v1-clippy-target-macos-{{ checksum "Cargo.lock" }}
+          paths:
+            - target
+      - restore_cache:
+          keys:
+            - v1-test-target-macos-{{ checksum "Cargo.lock" }}
+      - run:
+          name: cargo test --workspace
+          command: cargo test --workspace --no-fail-fast
+          no_output_timeout: 45m
+      - save_cargo_cache:
+          os: macos
+      - save_cache:
+          key: v1-test-target-macos-{{ checksum "Cargo.lock" }}
+          paths:
+            - target
+
+  build_and_test_windows:
+    # Windows coverage exists so crates/gpui_windows (whole-crate
+    # #![cfg(target_os = "windows")]) is actually compiled/linted/tested;
+    # it's cfg'd out to a no-op on Linux and macOS.
+    #
+    # docs/src/development/windows.md requires VS Build Tools with the C++
+    # desktop workload + a Windows 11 SDK, and CMake. The windows-server-2022
+    # image ships VS 2022 Build Tools by default (per CircleCI's published
+    # image contents), but CMake presence is NOT documented either way —
+    # ASSUMPTION: installed defensively via choco below; verify on first run
+    # whether the specific SDK component versions windows.md calls for
+    # (e.g. Windows11SDK.26100) are already present, since script/bootstrap.ps1
+    # itself doesn't install/verify them (it's collab/Postgres-only).
+    #
+    # PowerShell `run` steps do not persist process environment/PATH changes
+    # to later steps (unlike $BASH_ENV on Linux/macOS) — CircleCI's own
+    # guidance is that this must be re-derived per step, so every step below
+    # that needs cargo/cmake re-adds their install dirs to $env:PATH itself
+    # rather than relying on choco's system-PATH registry write (which a
+    # freshly spawned step process is not guaranteed to pick up).
+    resource_class: windows.xlarge
+    machine:
+      image: windows-server-2022-gui:current
+      shell: powershell.exe -ExecutionPolicy Bypass
+    steps:
+      - checkout
+      - run:
+          name: Install cmake (docs/src/development/windows.md)
+          command: choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
+      - run:
+          name: Install rustup (script/install-rustup.ps1)
+          command: powershell.exe -ExecutionPolicy Bypass -File script/install-rustup.ps1
+      - run:
+          name: Provision pinned toolchain (rust-toolchain.toml)
+          command: |
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\CMake\bin;$env:PATH"
+            rustup show
+      - restore_cargo_cache:
+          os: windows
+      - restore_cache:
+          keys:
+            - v1-clippy-target-windows-{{ checksum "Cargo.lock" }}
+      - run:
+          name: cargo clippy --workspace --release --all-targets --all-features
+          command: |
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\CMake\bin;$env:PATH"
+            cargo clippy --workspace --release --all-targets --all-features -- --deny warnings
+          no_output_timeout: 45m
+      - save_cache:
+          key: v1-clippy-target-windows-{{ checksum "Cargo.lock" }}
+          paths:
+            - target
+      - restore_cache:
+          keys:
+            - v1-test-target-windows-{{ checksum "Cargo.lock" }}
+      - run:
+          name: cargo test --workspace
+          command: |
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\CMake\bin;$env:PATH"
+            cargo test --workspace --no-fail-fast
+          no_output_timeout: 45m
+      - save_cargo_cache:
+          os: windows
+      - save_cache:
+          key: v1-test-target-windows-{{ checksum "Cargo.lock" }}
+          paths:
+            - target
+
+workflows:
+  build_and_test:
+    jobs:
+      - check_fmt
+      - check_licenses
+      - clippy
+      - test_linux
+      - build_and_test_macos
+      - build_and_test_windows
