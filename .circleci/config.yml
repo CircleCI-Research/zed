@@ -64,6 +64,40 @@ commands:
             - ~/.cargo/registry
             - ~/.cargo/git
 
+  install_rust_toolchain_windows:
+    description: >
+      Install rustup unconditionally and provision the pinned toolchain.
+      Unlike install_rust_toolchain (Linux/macOS), this doesn't reuse
+      script/install-rustup.ps1 or check for existing rustup first — see the
+      comment above the `run` step for why.
+    steps:
+      - run:
+          # script/install-rustup.ps1 skips installing rustup entirely if
+          # *any* `cargo` is already on PATH (it's written for local dev
+          # machines, where whatever Rust is present is fine). An actual run
+          # (pipeline a1fbb638-0ae2-4264-88c9-cb6402ae4444, job
+          # build_and_test_windows) showed this image ships a bare cargo
+          # 1.95.0 with no rustup.exe at all — that short-circuit fired,
+          # rustup was never installed, and `rustup show` then failed with
+          # "not recognized". CI needs the exact toolchain rust-toolchain.toml
+          # pins (1.97.1), not whatever happens to be preinstalled, so this
+          # installs rustup directly and unconditionally instead of reusing
+          # that script.
+          name: Install rustup
+          command: |
+            if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+              $tempDir = [System.IO.Path]::GetTempPath()
+              $rustupInitPath = "$tempDir\rustup-init.exe"
+              Invoke-WebRequest -OutFile $rustupInitPath -Uri https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
+              & $rustupInitPath -y --default-toolchain none
+              Remove-Item -Force $rustupInitPath
+            }
+      - run:
+          name: Provision pinned toolchain (rust-toolchain.toml)
+          command: |
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\CMake\bin;$env:PATH"
+            rustup show
+
 jobs:
   check_fmt:
     # Formatting only needs rustfmt against source text, not a full native
@@ -104,8 +138,24 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Disable needrestart's interactive service-restart prompt
+          # apt-get install triggers needrestart's "which services should be
+          # restarted?" debconf dialog on this image. It reads from the real
+          # pty CircleCI attaches, so it hangs until the step's silence
+          # timeout kills it instead of failing fast — confirmed by an
+          # actual run (see pipeline a1fbb638-0ae2-4264-88c9-cb6402ae4444).
+          # script/linux calls `sudo apt-get install` internally without
+          # `-E`, so an exported DEBIAN_FRONTEND/NEEDRESTART_MODE in this
+          # step would not survive that nested sudo — writing needrestart's
+          # own config file sidesteps that entirely, since it's read
+          # directly regardless of how apt was invoked.
+          command: |
+            sudo mkdir -p /etc/needrestart
+            echo "\$nrconf{restart} = 'a';" | sudo tee /etc/needrestart/needrestart.conf > /dev/null
+      - run:
           name: Install Linux system dependencies (script/linux)
           command: bash script/linux
+          no_output_timeout: 20m
       - install_rust_toolchain
       - restore_cargo_cache:
           os: linux
@@ -150,8 +200,15 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Disable needrestart's interactive service-restart prompt
+          # See the identical step in the clippy job for why.
+          command: |
+            sudo mkdir -p /etc/needrestart
+            echo "\$nrconf{restart} = 'a';" | sudo tee /etc/needrestart/needrestart.conf > /dev/null
+      - run:
           name: Install Linux system dependencies (script/linux)
           command: bash script/linux
+          no_output_timeout: 20m
       - run:
           name: Install software Vulkan driver for GPU-less CI (lavapipe)
           command: sudo apt-get install -y mesa-vulkan-drivers
@@ -172,12 +229,12 @@ jobs:
           paths:
             - target
 
-  build_and_test_macos:
+  clippy_macos:
     # macOS coverage exists specifically so that crates/gpui_macos and
     # crates/gpui_apple (Metal backends, whole-crate #![cfg(target_os =
-    # "macos")]) actually get compiled, linted, and tested at all — on
-    # Linux they are cfg'd out to an empty no-op shell, so Linux clippy/test
-    # never touches that code.
+    # "macos")]) actually get compiled and linted at all — on Linux they
+    # are cfg'd out to an empty no-op shell, so Linux clippy never touches
+    # that code.
     #
     # Xcode version and resource_class are chosen from CircleCI's currently
     # documented macOS support (Apple silicon only; Intel resource classes
@@ -209,10 +266,37 @@ jobs:
           name: script/clippy
           command: script/clippy
           no_output_timeout: 45m
+      - save_cargo_cache:
+          os: macos
       - save_cache:
           key: v1-clippy-target-macos-{{ checksum "Cargo.lock" }}
           paths:
             - target
+
+  test_macos:
+    # Kept as a separate job from clippy_macos rather than combined: an
+    # earlier combined version restored both the clippy job's --release
+    # target cache AND the test job's debug target cache into the same
+    # `target/` directory in one job, and the disk simply ran out mid-link
+    # (`ld: write() failed, errno=28` = ENOSPC) — confirmed by an actual run
+    # (pipeline a1fbb638-0ae2-4264-88c9-cb6402ae4444, job
+    # build_and_test_macos). Splitting keeps each job's on-disk footprint to
+    # one build profile at a time.
+    macos:
+      xcode: 16.4.0
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - run:
+          name: Set BINDGEN_EXTRA_CLANG_ARGS from active SDK
+          command: |
+            echo "export BINDGEN_EXTRA_CLANG_ARGS=\"--sysroot=$(xcrun --show-sdk-path)\"" >> "$BASH_ENV"
+      - run:
+          name: Install cmake (docs/src/development/macos.md)
+          command: brew install cmake
+      - install_rust_toolchain
+      - restore_cargo_cache:
+          os: macos
       - restore_cache:
           keys:
             - v1-test-target-macos-{{ checksum "Cargo.lock" }}
@@ -227,10 +311,10 @@ jobs:
           paths:
             - target
 
-  build_and_test_windows:
+  clippy_windows:
     # Windows coverage exists so crates/gpui_windows (whole-crate
-    # #![cfg(target_os = "windows")]) is actually compiled/linted/tested;
-    # it's cfg'd out to a no-op on Linux and macOS.
+    # #![cfg(target_os = "windows")]) is actually compiled/linted; it's
+    # cfg'd out to a no-op on Linux and macOS.
     #
     # docs/src/development/windows.md requires VS Build Tools with the C++
     # desktop workload + a Windows 11 SDK, and CMake. The windows-server-2022
@@ -256,14 +340,7 @@ jobs:
       - run:
           name: Install cmake (docs/src/development/windows.md)
           command: choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
-      - run:
-          name: Install rustup (script/install-rustup.ps1)
-          command: powershell.exe -ExecutionPolicy Bypass -File script/install-rustup.ps1
-      - run:
-          name: Provision pinned toolchain (rust-toolchain.toml)
-          command: |
-            $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\CMake\bin;$env:PATH"
-            rustup show
+      - install_rust_toolchain_windows
       - restore_cargo_cache:
           os: windows
       - restore_cache:
@@ -275,10 +352,30 @@ jobs:
             $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\CMake\bin;$env:PATH"
             cargo clippy --workspace --release --all-targets --all-features -- --deny warnings
           no_output_timeout: 45m
+      - save_cargo_cache:
+          os: windows
       - save_cache:
           key: v1-clippy-target-windows-{{ checksum "Cargo.lock" }}
           paths:
             - target
+
+  test_windows:
+    # Kept separate from clippy_windows for the same reason as
+    # test_macos/clippy_macos: coexisting release + debug target/ output in
+    # one job exhausted disk on macOS (ENOSPC during linking) in an earlier
+    # combined version, and the risk is identical here.
+    resource_class: windows.xlarge
+    machine:
+      image: windows-server-2022-gui:current
+      shell: powershell.exe -ExecutionPolicy Bypass
+    steps:
+      - checkout
+      - run:
+          name: Install cmake (docs/src/development/windows.md)
+          command: choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
+      - install_rust_toolchain_windows
+      - restore_cargo_cache:
+          os: windows
       - restore_cache:
           keys:
             - v1-test-target-windows-{{ checksum "Cargo.lock" }}
@@ -302,5 +399,7 @@ workflows:
       - check_licenses
       - clippy
       - test_linux
-      - build_and_test_macos
-      - build_and_test_windows
+      - clippy_macos
+      - test_macos
+      - clippy_windows
+      - test_windows
