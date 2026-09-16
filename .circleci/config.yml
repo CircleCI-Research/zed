@@ -463,33 +463,56 @@ jobs:
           # component; the windows-server-2022-gui image's VS Build Tools
           # install doesn't include it, which fails a downstream crate's
           # build script ("No spectre-mitigated libs were found", confirmed
-          # on pipeline 0d27d8ee-f08a-4924-a692-496971f1dd9f, job
-          # clippy_windows) rather than failing cleanly up front.
+          # on pipeline 0d27d8ee-f08a-4924-a692-496971f1dd9f).
           #
-          # This goes through choco's own `visualstudio2022buildtools`
-          # package (which just re-invokes the same VS bootstrapper with
-          # --package-parameters, detects the existing install, and modifies
-          # it in place) rather than calling vs_installer.exe directly.
-          # vs_installer.exe modify --quiet is documented to require
-          # administrator elevation and to reject non-elevated callers
-          # outright — an untested code path here, and the exact kind of
-          # thing that could otherwise hang on a UAC prompt non-interactively
-          # (the same failure class as the needrestart dialog earlier in
-          # this config). choco already proved it has whatever privilege it
-          # needs on this image (the cmake install below succeeded twice),
-          # so reusing it avoids introducing a second, unverified elevation
-          # path.
+          # This went through choco's own `visualstudio2022buildtools`
+          # package for two rounds and failed differently each time:
+          #   1. Without --force, choco's own package tracking saw the
+          #      package as already installed and silently no-op'd
+          #      ("already installed... 0/1 packages"), never invoking the
+          #      bootstrapper at all despite reporting success (pipeline
+          #      b3ec874d-c5e7-4357-a482-b5e7e54cef02).
+          #   2. With --force, it genuinely reinstalled (real multi-minute
+          #      download) but STILL never applied --package-parameters —
+          #      grepping the install log for "Spectre" found nothing
+          #      (pipeline 5ab3420f-ca9e-4e0b-a6b0-bbd1a8e261af). This
+          #      chocolatey package appears to ignore custom parameters on a
+          #      forced reinstall over an existing install. --force also
+          #      made every run depend on a live download from
+          #      community.chocolatey.org, which failed with a transient 503
+          #      in the same pipeline (job test_windows).
           #
-          # --force is required: choco's own package tracking already shows
-          # visualstudio2022buildtools as installed (baked into this image),
-          # so without --force it silently no-ops ("already installed...
-          # 0/1 packages") and never even invokes the bootstrapper with our
-          # --package-parameters — confirmed on pipeline
-          # b3ec874d-c5e7-4357-a482-b5e7e54cef02, job clippy_windows, where
-          # the step reported success but the Spectre component was still
-          # missing when the actual build ran.
+          # Calling vs_installer.exe directly is what actually works:
+          # canonical, Microsoft-documented, and the earlier concern about
+          # it needing elevation is moot — choco's own successful multi-
+          # minute system-wide install proves this session is already
+          # elevated. Retry a few times to absorb transient network
+          # failures, and verify via `vswhere -requires` that the component
+          # is actually present afterward rather than trusting the exit
+          # code — a reinstall can "succeed" without applying what we asked
+          # for, per the choco experience above.
           name: Add missing VS component (Spectre-mitigated libs)
-          command: choco install visualstudio2022buildtools -y --force --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
+          command: |
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $component = "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre"
+            $maxAttempts = 3
+            for ($i = 1; $i -le $maxAttempts; $i++) {
+              $vsPath = & $vsWhere -latest -property installationPath
+              & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart --wait
+              $exitCode = $LASTEXITCODE
+              $found = & $vsWhere -latest -requires $component -property installationPath
+              if (($exitCode -eq 0 -or $exitCode -eq 3010) -and $found) {
+                Write-Output "Spectre-mitigated libs component confirmed present."
+                break
+              }
+              if ($i -eq $maxAttempts) {
+                Write-Error "Failed to add/verify Spectre-mitigated libs component after $maxAttempts attempts (last vs_installer exit code: $exitCode)"
+                exit 1
+              }
+              Write-Output "Attempt $i failed (exit $exitCode, verified=$([bool]$found)) - retrying in 15s..."
+              Start-Sleep -Seconds 15
+            }
           no_output_timeout: 20m
       - run:
           name: Install cmake (docs/src/development/windows.md)
@@ -536,11 +559,31 @@ jobs:
     steps:
       - checkout
       - run:
-          # See the identical step in the clippy_windows job for why this
-          # goes through choco rather than calling vs_installer.exe directly,
-          # and why --force is required.
+          # See the identical step in the clippy_windows job for the full
+          # history of why this calls vs_installer.exe directly (with retry
+          # + verification) instead of choco.
           name: Add missing VS component (Spectre-mitigated libs)
-          command: choco install visualstudio2022buildtools -y --force --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
+          command: |
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $component = "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre"
+            $maxAttempts = 3
+            for ($i = 1; $i -le $maxAttempts; $i++) {
+              $vsPath = & $vsWhere -latest -property installationPath
+              & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart --wait
+              $exitCode = $LASTEXITCODE
+              $found = & $vsWhere -latest -requires $component -property installationPath
+              if (($exitCode -eq 0 -or $exitCode -eq 3010) -and $found) {
+                Write-Output "Spectre-mitigated libs component confirmed present."
+                break
+              }
+              if ($i -eq $maxAttempts) {
+                Write-Error "Failed to add/verify Spectre-mitigated libs component after $maxAttempts attempts (last vs_installer exit code: $exitCode)"
+                exit 1
+              }
+              Write-Output "Attempt $i failed (exit $exitCode, verified=$([bool]$found)) - retrying in 15s..."
+              Start-Sleep -Seconds 15
+            }
           no_output_timeout: 20m
       - run:
           name: Install cmake (docs/src/development/windows.md)
