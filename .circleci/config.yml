@@ -204,15 +204,13 @@ jobs:
     # Docker (already available on this machine executor) specifically for
     # those.
     #
-    # ASSUMPTION (unverified — no CircleCI account access to actually run
-    # this): most `#[gpui::test]`s run against gpui's mocked TestPlatform,
-    # not a real display. But crates/gpui_wgpu and the platform-native gpui
-    # crates have their own #[test]s that may try to initialize a real
-    # Vulkan/GL device, and this CI machine has no GPU. `libvulkan1` from
-    # script/linux is only the loader, not a software driver, so a
-    # software Vulkan ICD (lavapipe) is installed defensively below. If
-    # tests still fail here for want of a display, this job needs revisiting
-    # (e.g. xvfb-run) once it has actually been run once.
+    # CONFIRMED (pipeline 0d27d8ee-f08a-4924-a692-496971f1dd9f): no GPU/display
+    # related test failures occurred here — every failure was a `_postgres`
+    # test, and `cargo test --workspace` otherwise ran to completion. Most
+    # `#[gpui::test]`s run against gpui's mocked TestPlatform, not a real
+    # display, and the defensively-installed software Vulkan ICD (lavapipe)
+    # below was apparently sufficient for whatever crates/gpui_wgpu tests do
+    # run. Kept installed since it's a one-line apt package with no downside.
     #
     # CARGO_PROFILE_TEST_DEBUG=0, CARGO_INCREMENTAL=0: `cargo test
     # --workspace` across 243 crates produces one debug test binary per
@@ -263,7 +261,11 @@ jobs:
           # no password and needs CREATE DATABASE — trust auth on a throwaway
           # container satisfies that without touching real credentials.
           name: Start Postgres for collab's Postgres-variant tests
+          # Docker is documented as preinstalled on this machine image, but
+          # fail with a clear message here rather than a confusing error
+          # buried inside the pg_isready retry loop if that's ever wrong.
           command: |
+            docker version > /dev/null || { echo "docker is not available on this image" >&2; exit 1; }
             docker run -d --name zed-test-postgres -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:15
             for i in $(seq 1 30); do
               docker exec zed-test-postgres pg_isready -U postgres && exit 0
@@ -297,10 +299,11 @@ jobs:
     #
     # Xcode version and resource_class are chosen from CircleCI's currently
     # documented macOS support (Apple silicon only; Intel resource classes
-    # were deprecated) as of this writing, but neither was pinned by the
-    # repo itself (docs/src/development/macos.md doesn't pin an Xcode
-    # version) — ASSUMPTION: confirm `xcode: 16.4.0` and `m4pro.medium` are
-    # still valid/available on your CircleCI plan before relying on this.
+    # were deprecated) as of this writing; neither was pinned by the repo
+    # itself (docs/src/development/macos.md doesn't pin an Xcode version).
+    # CONFIRMED valid/available on this CircleCI plan (executor resolved and
+    # ran successfully across multiple pipelines, e.g.
+    # 0d27d8ee-f08a-4924-a692-496971f1dd9f).
     macos:
       xcode: 16.4.0
     resource_class: m4pro.medium
@@ -379,9 +382,21 @@ jobs:
           keys:
             - v1-test-target-macos-{{ checksum "Cargo.lock" }}
       - run:
+          # This job has hit ENOSPC twice already (once from debug info,
+          # once from incremental-compilation artifacts). If
+          # CARGO_PROFILE_TEST_DEBUG=0 + CARGO_INCREMENTAL=0 aren't enough
+          # either, this makes that immediately visible in the job output
+          # instead of requiring another guess-and-push cycle.
+          name: Show available disk space before testing
+          command: df -h /
+      - run:
           name: cargo test --workspace
           command: cargo test --workspace --no-fail-fast
           no_output_timeout: 45m
+      - run:
+          name: Show available disk space after testing
+          command: df -h /
+          when: always
       - save_cargo_cache:
           os: macos
       - save_cache:
@@ -395,13 +410,14 @@ jobs:
     # cfg'd out to a no-op on Linux and macOS.
     #
     # docs/src/development/windows.md requires VS Build Tools with the C++
-    # desktop workload + a Windows 11 SDK, and CMake. The windows-server-2022
-    # image ships VS 2022 Build Tools by default (per CircleCI's published
-    # image contents), but CMake presence is NOT documented either way —
-    # ASSUMPTION: installed defensively via choco below; verify on first run
-    # whether the specific SDK component versions windows.md calls for
-    # (e.g. Windows11SDK.26100) are already present, since script/bootstrap.ps1
-    # itself doesn't install/verify them (it's collab/Postgres-only).
+    # desktop workload + a Windows 11 SDK, and CMake. CMake presence wasn't
+    # documented either way, so it's installed defensively via choco below.
+    # The VC.Tools.x86.x64/Windows SDK components ARE confirmed present:
+    # an earlier failed run (pipeline 0d27d8ee-f08a-4924-a692-496971f1dd9f)
+    # got well into compiling the workspace — dozens of crates built
+    # successfully — before failing on one specific missing component
+    # (Spectre-mitigated libs, handled below), which is good evidence the
+    # rest of the toolchain is intact rather than broadly incomplete.
     #
     # PowerShell `run` steps do not persist process environment/PATH changes
     # to later steps (unlike $BASH_ENV on Linux/macOS) — CircleCI's own
@@ -433,16 +449,23 @@ jobs:
           # build script ("No spectre-mitigated libs were found", confirmed
           # on pipeline 0d27d8ee-f08a-4924-a692-496971f1dd9f, job
           # clippy_windows) rather than failing cleanly up front.
+          #
+          # This goes through choco's own `visualstudio2022buildtools`
+          # package (which just re-invokes the same VS bootstrapper with
+          # --package-parameters, detects the existing install, and modifies
+          # it in place) rather than calling vs_installer.exe directly.
+          # vs_installer.exe modify --quiet is documented to require
+          # administrator elevation and to reject non-elevated callers
+          # outright — an untested code path here, and the exact kind of
+          # thing that could otherwise hang on a UAC prompt non-interactively
+          # (the same failure class as the needrestart dialog earlier in
+          # this config). choco already proved it has whatever privilege it
+          # needs on this image (the cmake install below succeeded twice),
+          # so reusing it avoids introducing a second, unverified elevation
+          # path.
           name: Add missing VS component (Spectre-mitigated libs)
-          command: |
-            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-            $vsPath = & $vsWhere -latest -property installationPath
-            & $vsInstaller modify --installPath "$vsPath" --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart --wait
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
-              Write-Error "vs_installer modify failed with exit code $LASTEXITCODE"
-              exit 1
-            }
+          command: choco install visualstudio2022buildtools -y --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
+          no_output_timeout: 20m
       - run:
           name: Install cmake (docs/src/development/windows.md)
           command: choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
@@ -485,17 +508,11 @@ jobs:
     steps:
       - checkout
       - run:
-          # See the identical step in the clippy_windows job for why.
+          # See the identical step in the clippy_windows job for why this
+          # goes through choco rather than calling vs_installer.exe directly.
           name: Add missing VS component (Spectre-mitigated libs)
-          command: |
-            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-            $vsPath = & $vsWhere -latest -property installationPath
-            & $vsInstaller modify --installPath "$vsPath" --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart --wait
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
-              Write-Error "vs_installer modify failed with exit code $LASTEXITCODE"
-              exit 1
-            }
+          command: choco install visualstudio2022buildtools -y --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
+          no_output_timeout: 20m
       - run:
           name: Install cmake (docs/src/development/windows.md)
           command: choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
@@ -506,11 +523,21 @@ jobs:
           keys:
             - v1-test-target-windows-{{ checksum "Cargo.lock" }}
       - run:
+          # This job hasn't gotten far enough yet to hit macOS's disk
+          # exhaustion, but it builds the same 243-crate workspace, so
+          # surface free space up front rather than find out the hard way.
+          name: Show available disk space before testing
+          command: Get-PSDrive C
+      - run:
           name: cargo test --workspace
           command: |
             $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\CMake\bin;$env:PATH"
             cargo test --workspace --no-fail-fast
           no_output_timeout: 45m
+      - run:
+          name: Show available disk space after testing
+          command: Get-PSDrive C
+          when: always
       - save_cargo_cache:
           os: windows
       - save_cache:
