@@ -531,7 +531,7 @@ jobs:
             }
             for ($i = 1; $i -le $maxAttempts; $i++) {
               $vsPath = Resolve-VsPath
-              Write-Output "Attempt $i: modifying VS instance at '$vsPath'"
+              Write-Output "Attempt ${i}: modifying VS instance at '$vsPath'"
               & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart
               $elapsedSeconds = 0
               $found = $null
@@ -635,7 +635,7 @@ jobs:
             }
             for ($i = 1; $i -le $maxAttempts; $i++) {
               $vsPath = Resolve-VsPath
-              Write-Output "Attempt $i: modifying VS instance at '$vsPath'"
+              Write-Output "Attempt ${i}: modifying VS instance at '$vsPath'"
               & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart
               $elapsedSeconds = 0
               $found = $null
