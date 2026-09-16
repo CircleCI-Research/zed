@@ -366,6 +366,12 @@ jobs:
     environment:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      # collab's tests aren't the only chatty ones — crates/watch's tests log
+      # every channel send/receive at INFO too, which hit the same 50MB
+      # output cap as collab did on Linux (confirmed on pipeline
+      # b3ec874d-c5e7-4357-a482-b5e7e54cef02, job test_macos: the real
+      # failure was pushed out of the retained log by watch::tests noise).
+      RUST_LOG: warn
     steps:
       - checkout
       - run:
@@ -375,6 +381,16 @@ jobs:
       - run:
           name: Install cmake (docs/src/development/macos.md)
           command: brew install cmake
+      - run:
+          # macOS's default per-process file-descriptor limit is much lower
+          # than Linux's. `cargo test --workspace` runs hundreds of tests
+          # concurrently, many opening their own sqlite DB and sockets, and
+          # exhausted it: "Failed to initialize Tokio: Os { code: 24, ...,
+          # message: \"Too many open files\" }" (confirmed on pipeline
+          # b3ec874d-c5e7-4357-a482-b5e7e54cef02, job test_macos — dozens of
+          # collab/editor integration tests failed this way).
+          name: Raise the file-descriptor limit for the test run
+          command: echo 'ulimit -n 10240' >> "$BASH_ENV"
       - install_rust_toolchain
       - restore_cargo_cache:
           os: macos
@@ -463,8 +479,17 @@ jobs:
           # needs on this image (the cmake install below succeeded twice),
           # so reusing it avoids introducing a second, unverified elevation
           # path.
+          #
+          # --force is required: choco's own package tracking already shows
+          # visualstudio2022buildtools as installed (baked into this image),
+          # so without --force it silently no-ops ("already installed...
+          # 0/1 packages") and never even invokes the bootstrapper with our
+          # --package-parameters — confirmed on pipeline
+          # b3ec874d-c5e7-4357-a482-b5e7e54cef02, job clippy_windows, where
+          # the step reported success but the Spectre component was still
+          # missing when the actual build ran.
           name: Add missing VS component (Spectre-mitigated libs)
-          command: choco install visualstudio2022buildtools -y --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
+          command: choco install visualstudio2022buildtools -y --force --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
           no_output_timeout: 20m
       - run:
           name: Install cmake (docs/src/development/windows.md)
@@ -505,13 +530,17 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      # See test_macos for why: crates/watch's tests are also chatty at
+      # INFO level and can hit CircleCI's 50MB-per-step output cap.
+      RUST_LOG: warn
     steps:
       - checkout
       - run:
           # See the identical step in the clippy_windows job for why this
-          # goes through choco rather than calling vs_installer.exe directly.
+          # goes through choco rather than calling vs_installer.exe directly,
+          # and why --force is required.
           name: Add missing VS component (Spectre-mitigated libs)
-          command: choco install visualstudio2022buildtools -y --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
+          command: choco install visualstudio2022buildtools -y --force --no-progress --package-parameters "--add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart"
           no_output_timeout: 20m
       - run:
           name: Install cmake (docs/src/development/windows.md)
