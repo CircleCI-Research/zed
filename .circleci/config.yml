@@ -486,32 +486,73 @@ jobs:
           # canonical, Microsoft-documented, and the earlier concern about
           # it needing elevation is moot — choco's own successful multi-
           # minute system-wide install proves this session is already
-          # elevated. Retry a few times to absorb transient network
-          # failures, and verify via `vswhere -requires` that the component
-          # is actually present afterward rather than trusting the exit
-          # code — a reinstall can "succeed" without applying what we asked
-          # for, per the choco experience above.
+          # elevated.
+          #
+          # --wait does NOT work on this image's installer (v4.6.58):
+          # confirmed via dd_installer_*.log in %TEMP%, `modify --wait`
+          # fails argument parsing ("Option 'wait' is unknown", exit 87)
+          # before it even starts. But vs_installer.exe is only a launcher
+          # that hands off to a background setup.exe and returns
+          # immediately regardless — so $LASTEXITCODE reflects the
+          # launcher's parse failure, not the (never-started) install, and
+          # the previous version of this script's exit-code check never
+          # caught it. Since there's no working synchronous wait, poll
+          # `vswhere -requires` until the background install finishes
+          # instead of trusting any exit code.
           name: Add missing VS component (Spectre-mitigated libs)
           command: |
             $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
             $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
             $component = "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre"
             $maxAttempts = 3
+            $pollIntervalSeconds = 15
+            $pollTimeoutSeconds = 600
+            # This image has two VS instances (BuildTools and Community) —
+            # `vswhere -latest` alone resolves to whichever was installed
+            # more recently (Community on this image, confirmed via a live
+            # SSH debug session), which may not be the instance cargo/rustc
+            # actually links against. Target the BuildTools product
+            # explicitly (the one docs/src/development/windows.md's
+            # component lists are written for), falling back to -latest
+            # only if BuildTools isn't present at all.
+            function Resolve-VsPath {
+              $path = & $vsWhere -products Microsoft.VisualStudio.Product.BuildTools -property installationPath
+              if (-not $path) {
+                $path = & $vsWhere -latest -property installationPath
+              }
+              return $path
+            }
+            function Test-ComponentPresent {
+              $result = & $vsWhere -products Microsoft.VisualStudio.Product.BuildTools -requires $component -property installationPath
+              if (-not $result) {
+                $result = & $vsWhere -latest -requires $component -property installationPath
+              }
+              return $result
+            }
             for ($i = 1; $i -le $maxAttempts; $i++) {
-              $vsPath = & $vsWhere -latest -property installationPath
-              & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart --wait
-              $exitCode = $LASTEXITCODE
-              $found = & $vsWhere -latest -requires $component -property installationPath
-              if (($exitCode -eq 0 -or $exitCode -eq 3010) -and $found) {
+              $vsPath = Resolve-VsPath
+              Write-Output "Attempt $i: modifying VS instance at '$vsPath'"
+              & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart
+              $elapsedSeconds = 0
+              $found = $null
+              while ($elapsedSeconds -lt $pollTimeoutSeconds) {
+                Start-Sleep -Seconds $pollIntervalSeconds
+                $elapsedSeconds += $pollIntervalSeconds
+                Write-Output "Polling for component... (${elapsedSeconds}s/${pollTimeoutSeconds}s)"
+                $found = Test-ComponentPresent
+                if ($found) {
+                  break
+                }
+              }
+              if ($found) {
                 Write-Output "Spectre-mitigated libs component confirmed present."
                 break
               }
               if ($i -eq $maxAttempts) {
-                Write-Error "Failed to add/verify Spectre-mitigated libs component after $maxAttempts attempts (last vs_installer exit code: $exitCode)"
+                Write-Error "Failed to add/verify Spectre-mitigated libs component after $maxAttempts attempts"
                 exit 1
               }
-              Write-Output "Attempt $i failed (exit $exitCode, verified=$([bool]$found)) - retrying in 15s..."
-              Start-Sleep -Seconds 15
+              Write-Output "Attempt $i did not verify within $pollTimeoutSeconds s - retrying..."
             }
           no_output_timeout: 20m
       - run:
@@ -568,21 +609,54 @@ jobs:
             $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
             $component = "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre"
             $maxAttempts = 3
+            $pollIntervalSeconds = 15
+            $pollTimeoutSeconds = 600
+            # This image has two VS instances (BuildTools and Community) —
+            # `vswhere -latest` alone resolves to whichever was installed
+            # more recently (Community on this image, confirmed via a live
+            # SSH debug session), which may not be the instance cargo/rustc
+            # actually links against. Target the BuildTools product
+            # explicitly (the one docs/src/development/windows.md's
+            # component lists are written for), falling back to -latest
+            # only if BuildTools isn't present at all.
+            function Resolve-VsPath {
+              $path = & $vsWhere -products Microsoft.VisualStudio.Product.BuildTools -property installationPath
+              if (-not $path) {
+                $path = & $vsWhere -latest -property installationPath
+              }
+              return $path
+            }
+            function Test-ComponentPresent {
+              $result = & $vsWhere -products Microsoft.VisualStudio.Product.BuildTools -requires $component -property installationPath
+              if (-not $result) {
+                $result = & $vsWhere -latest -requires $component -property installationPath
+              }
+              return $result
+            }
             for ($i = 1; $i -le $maxAttempts; $i++) {
-              $vsPath = & $vsWhere -latest -property installationPath
-              & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart --wait
-              $exitCode = $LASTEXITCODE
-              $found = & $vsWhere -latest -requires $component -property installationPath
-              if (($exitCode -eq 0 -or $exitCode -eq 3010) -and $found) {
+              $vsPath = Resolve-VsPath
+              Write-Output "Attempt $i: modifying VS instance at '$vsPath'"
+              & $vsInstaller modify --installPath "$vsPath" --add $component --quiet --norestart
+              $elapsedSeconds = 0
+              $found = $null
+              while ($elapsedSeconds -lt $pollTimeoutSeconds) {
+                Start-Sleep -Seconds $pollIntervalSeconds
+                $elapsedSeconds += $pollIntervalSeconds
+                Write-Output "Polling for component... (${elapsedSeconds}s/${pollTimeoutSeconds}s)"
+                $found = Test-ComponentPresent
+                if ($found) {
+                  break
+                }
+              }
+              if ($found) {
                 Write-Output "Spectre-mitigated libs component confirmed present."
                 break
               }
               if ($i -eq $maxAttempts) {
-                Write-Error "Failed to add/verify Spectre-mitigated libs component after $maxAttempts attempts (last vs_installer exit code: $exitCode)"
+                Write-Error "Failed to add/verify Spectre-mitigated libs component after $maxAttempts attempts"
                 exit 1
               }
-              Write-Output "Attempt $i failed (exit $exitCode, verified=$([bool]$found)) - retrying in 15s..."
-              Start-Sleep -Seconds 15
+              Write-Output "Attempt $i did not verify within $pollTimeoutSeconds s - retrying..."
             }
           no_output_timeout: 20m
       - run:
